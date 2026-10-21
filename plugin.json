@@ -1,0 +1,19 @@
+{
+  "name": "PS5 Hardware Control",
+  "author": "zadargabriel",
+  "api_version": 1,
+  "flags": [
+    "root"
+  ],
+  "publish": {
+    "tags": [
+      "hardware",
+      "ps5",
+      "fan",
+      "led",
+      "root"
+    ],
+    "description": "Control the PlayStation 5 fan target temperature, indicator LED presets and chassis buzzer on Linux.",
+    "image": ""
+  }
+}
