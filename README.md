@@ -1,15 +1,17 @@
 <h1 align="center">ps5-hwcon-plugin</h1>
 
 <p align="center">
-  <img src="docs/screenshot-fan.png" alt="Fan tab" width="30%">
+  <img src="docs/screenshot-fan.png" alt="Fan tab" width="23%">
   &nbsp;
-  <img src="docs/screenshot-led.png" alt="LED tab" width="30%">
+  <img src="docs/screenshot-cpu.png" alt="CPU tab" width="23%">
   &nbsp;
-  <img src="docs/screenshot-buzzer.png" alt="Buzzer tab" width="30%">
+  <img src="docs/screenshot-led.png" alt="LED tab" width="23%">
+  &nbsp;
+  <img src="docs/screenshot-buzzer.png" alt="Buzzer tab" width="23%">
 </p>
 
 <p align="center">
-  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan target temperature, live temperatures, indicator LED presets and the chassis buzzer, all from the Quick Access Menu.
+  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan target temperature, live temperatures, CPU governor, indicator LED presets and the chassis buzzer, all from the Quick Access Menu.
 </p>
 
 ---
@@ -36,6 +38,17 @@ To uninstall:
 curl -fsSL https://raw.githubusercontent.com/NotHavocc/ps5-hwcon-plugin/main/install.sh | bash -s -- --uninstall
 ```
 
+### Install from a .zip
+
+This skips the build, so you don't need `git`, Node.js or podman.
+
+1. Download `ps5-hwcon-plugin.zip` from the [Releases](https://github.com/NotHavocc/ps5-hwcon-plugin/releases) page, or build it yourself with `npm run zip` (it lands in `out/`).
+2. In the Decky menu, open Settings (the gear icon).
+3. Under **General**, turn on **Developer mode**.
+4. Open the **Developer** section and choose **Install Plugin from ZIP File**, then pick the zip.
+
+To update, install the newer zip the same way. Your settings are kept.
+
 ### Requirements
 
 - A PS5 running Linux with the [ps5-linux-patches](https://github.com/rmuxnet/ps5-linux-patches-1) kernel booted. The plugin only talks to the sysfs interfaces that kernel adds.
@@ -55,6 +68,14 @@ curl -fsSL https://raw.githubusercontent.com/NotHavocc/ps5-hwcon-plugin/main/ins
 
 Thermal Guard and Overheat Alarm run in the background, even with the menu closed.
 
+### CPU
+
+- **Governor**: lists every cpufreq governor the kernel offers (`scaling_available_governors`) and applies your choice to all CPUs. Only governors built into or loaded by the kernel are shown.
+- **Status**: active governor, average and peak clock, hardware range and the cpufreq driver, refreshed every 2 s. If CPUs disagree, it shows **Mixed**.
+- **Restore on Startup**: re-applies your last governor when Decky starts.
+
+With an EPP driver such as `amd-pstate-epp`, the kernel only offers Performance and Powersave. The firmware still manages clocks under Powersave.
+
 ### LED
 
 - Quick buttons for Off, White Bright, Blue Rich, Purple, Orange Breathe and Pink Breathe.
@@ -64,8 +85,6 @@ Thermal Guard and Overheat Alarm run in the background, even with the menu close
 ### Buzzer
 
 - Short, Error and Long test beeps, plus Stop.
-
-logs/PS5 Hardware Control/`.
 
 ## Credits
 

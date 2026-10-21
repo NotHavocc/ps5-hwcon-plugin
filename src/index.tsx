@@ -22,6 +22,7 @@ import {
   FaShieldAlt,
   FaStop,
   FaSyncAlt,
+  FaTachometerAlt,
   FaThermometerHalf,
   FaVolumeUp,
   FaWind,
@@ -31,12 +32,15 @@ import {
   BackendMethods,
   BackendResult,
   BuzzerLevel,
+  CpuSettings,
+  CpuStatusData,
   CuratedPreset,
   FanPreset,
   FanSettings,
   FanSettingsUpdate,
   FanStatusData,
   FanStatusResult,
+  GovernorInfo,
   LedSettingsData,
   TabId,
 } from "./types";
@@ -153,8 +157,24 @@ const BUZZER_ACTIONS: { level: BuzzerLevel; label: string; description: string }
   { level: BuzzerLevel.Long, label: "Long Beep", description: "Sustained tone" },
 ];
 
+const GOVERNORS: Record<string, GovernorInfo> = {
+  performance: { label: "Performance", description: "Highest clocks" },
+  powersave: { label: "Powersave", description: "Lowest clocks" },
+  schedutil: { label: "Schedutil", description: "Follows scheduler load" },
+  ondemand: { label: "Ondemand", description: "Jumps up under load" },
+  conservative: { label: "Conservative", description: "Ramps up gradually" },
+  userspace: { label: "Userspace", description: "Speed set by a program" },
+};
+
+// With EPP drivers the hardware picks clocks itself; the governor only sets a bias.
+const EPP_GOVERNORS: Record<string, GovernorInfo> = {
+  performance: { label: "Performance", description: "Biased to max clocks" },
+  powersave: { label: "Powersave", description: "Firmware managed" },
+};
+
 const TABS: { id: TabId; label: string; icon: JSX.Element }[] = [
   { id: "fan", label: "Fan", icon: <FaWind /> },
+  { id: "cpu", label: "CPU", icon: <FaTachometerAlt /> },
   { id: "led", label: "LED", icon: <FaLightbulb /> },
   { id: "buzzer", label: "Buzzer", icon: <FaVolumeUp /> },
 ];
@@ -179,6 +199,16 @@ const prettifyPreset = (id: string) =>
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
+
+const formatFreq = (mhz: number) =>
+  mhz >= 1000 ? `${(mhz / 1000).toFixed(2)} GHz` : `${mhz} MHz`;
+
+const isEppDriver = (driver: string | null) =>
+  driver !== null && (driver.endsWith("-epp") || driver === "intel_pstate");
+
+const governorInfo = (id: string, driver: string | null): GovernorInfo =>
+  (isEppDriver(driver) ? EPP_GOVERNORS[id] : undefined) ??
+  GOVERNORS[id] ?? { label: prettifyPreset(id), description: "Kernel governor" };
 
 const InlineSpinner: FC = () => (
   <Spinner style={{ width: "1.2em", height: "1.2em", verticalAlign: "middle" }} />
@@ -560,6 +590,192 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   );
 };
 
+const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const [status, setStatus] = useState<CpuStatusData | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [applying, setApplying] = useState<string | null>(null);
+  const [settings, setSettings] = useState<CpuSettings | null>(null);
+  const [savingSettings, setSavingSettings] = useState<boolean>(false);
+  const alive = useRef<boolean>(true);
+  const polling = useRef<boolean>(false);
+
+  const refreshStatus = useCallback(async () => {
+    if (polling.current) {
+      return null;
+    }
+    polling.current = true;
+    const result = await call("get_cpu_status");
+    polling.current = false;
+    if (!alive.current) {
+      return null;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setStatusError(null);
+    } else {
+      setStatusError(result.error);
+    }
+    return result;
+  }, [call]);
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const [statusResult, settingsResult] = await Promise.all([
+        refreshStatus(),
+        call("get_cpu_settings"),
+      ]);
+      if (!alive.current) {
+        return;
+      }
+      if (statusResult) {
+        notify(statusResult, true);
+      }
+      if (settingsResult.success) {
+        setSettings(settingsResult.data);
+      } else {
+        notify(settingsResult);
+      }
+    })();
+    const timer = window.setInterval(refreshStatus, STATUS_POLL_MS);
+    return () => {
+      alive.current = false;
+      window.clearInterval(timer);
+    };
+  }, [refreshStatus, call, notify]);
+
+  const applyGovernor = async (governor: string) => {
+    setApplying(governor);
+    const result = await call("set_cpu_governor", governor);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setSettings((prev) => (prev ? { ...prev, saved_governor: governor } : prev));
+    }
+    notify(result);
+    setApplying(null);
+    refreshStatus();
+  };
+
+  const saveRestore = async (checked: boolean) => {
+    setSavingSettings(true);
+    const result = await call("set_cpu_settings", checked);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setSettings(result.data);
+    }
+    notify(result, true);
+    setSavingSettings(false);
+  };
+
+  const loading = status === null && statusError === null;
+  const driver = status?.driver ?? null;
+  const governors = status?.governors ?? [];
+  const active = status?.active ?? [];
+  const current = active.length === 1 ? active[0] : null;
+  const busy = applying !== null;
+
+  let governorValue: ReactNode = "Unavailable";
+  if (loading) {
+    governorValue = <InlineSpinner />;
+  } else if (current) {
+    governorValue = governorInfo(current, driver).label;
+  } else if (active.length > 1) {
+    governorValue = "Mixed";
+  }
+
+  const freqDescription = [
+    status?.freq_peak_mhz != null ? `Peak ${formatFreq(status.freq_peak_mhz)}` : null,
+    status?.hw_min_mhz != null && status?.hw_max_mhz != null
+      ? `Range ${formatFreq(status.hw_min_mhz)} – ${formatFreq(status.hw_max_mhz)}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const restoreDescription =
+    settings?.saved_governor != null
+      ? `Re-applies ${governorInfo(settings.saved_governor, driver).label} when Decky starts. The kernel picks its default governor at boot.`
+      : "Re-applies your last governor when Decky starts. The kernel picks its default governor at boot.";
+
+  return (
+    <>
+      <PanelSection title="CPU Frequency">
+        <PanelSectionRow>
+          <Field
+            label="Governor"
+            icon={<FaTachometerAlt />}
+            description={
+              statusError ?? (active.length > 1 ? `CPUs use ${active.join(", ")}` : undefined)
+            }
+          >
+            {governorValue}
+          </Field>
+        </PanelSectionRow>
+        {status !== null && (
+          <>
+            <PanelSectionRow>
+              <Field label="Frequency" icon={<FaMicrochip />} description={freqDescription || undefined}>
+                {status.freq_avg_mhz != null ? formatFreq(status.freq_avg_mhz) : "Unknown"}
+              </Field>
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <Field label="Driver" description={`${status.policy_count} frequency policies`}>
+                {driver ?? "Unknown"}
+              </Field>
+            </PanelSectionRow>
+          </>
+        )}
+      </PanelSection>
+      {governors.length > 0 && (
+        <PanelSection title={`Governors (${governors.length})`}>
+          {chunk(governors, 2).map((row, rowIndex) => (
+            <ButtonGrid key={row.join("|")} columns={2}>
+              {row.map((id, index) => {
+                const info = governorInfo(id, driver);
+                return (
+                  <DialogButton
+                    key={id}
+                    className={gridButtonClass(rowIndex * 2 + index, governors.length, 2)}
+                    disabled={busy}
+                    onClick={() => applyGovernor(id)}
+                    style={{ borderBottom: `2px solid ${current === id ? ACCENT : "transparent"}` }}
+                  >
+                    {applying === id ? (
+                      <InlineSpinner />
+                    ) : (
+                      <div className="ps5hw-stack">
+                        <span>{info.label}</span>
+                        <span className="ps5hw-sub">{info.description}</span>
+                      </div>
+                    )}
+                  </DialogButton>
+                );
+              })}
+            </ButtonGrid>
+          ))}
+        </PanelSection>
+      )}
+      <PanelSection title="Advanced">
+        <PanelSectionRow>
+          <ToggleField
+            label="Restore on Startup"
+            description={restoreDescription}
+            checked={settings?.restore_on_boot ?? false}
+            disabled={settings === null || savingSettings}
+            onChange={saveRestore}
+          />
+        </PanelSectionRow>
+      </PanelSection>
+    </>
+  );
+};
+
 const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
   const [presets, setPresets] = useState<string[] | null>(null);
@@ -836,6 +1052,7 @@ const Content: FC = () => {
         <TabBar active={tab} onChange={selectTab} />
       </PanelSection>
       {tab === "fan" && <FanTab backend={backend} />}
+      {tab === "cpu" && <CpuTab backend={backend} />}
       {tab === "led" && <LedTab backend={backend} />}
       {tab === "buzzer" && <BuzzerTab backend={backend} />}
     </>

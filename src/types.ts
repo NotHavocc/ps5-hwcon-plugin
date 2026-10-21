@@ -82,6 +82,27 @@ export interface LedPresetData extends LedSettingsData {
   preset: string;
 }
 
+export interface CpuStatusData {
+  driver: string | null;
+  governors: string[];
+  active: string[];
+  policy_count: number;
+  freq_avg_mhz: number | null;
+  freq_peak_mhz: number | null;
+  hw_min_mhz: number | null;
+  hw_max_mhz: number | null;
+}
+
+export interface CpuSettings {
+  restore_on_boot: boolean;
+  saved_governor: string | null;
+}
+
+export interface GovernorInfo {
+  label: string;
+  description: string;
+}
+
 export interface BuzzerData {
   level: number;
 }
@@ -93,6 +114,8 @@ export type FanSettingsResult = BackendResult<FanSettingsData>;
 export type LedPresetsResult = BackendResult<LedPresetsData>;
 export type LedPresetResult = BackendResult<LedPresetData>;
 export type LedSettingsResult = BackendResult<LedSettingsData>;
+export type CpuStatusResult = BackendResult<CpuStatusData>;
+export type CpuSettingsResult = BackendResult<CpuSettings>;
 export type BuzzerResult = BackendResult<BuzzerData>;
 export type StopBuzzerResult = BackendResult<null>;
 
@@ -117,6 +140,10 @@ export interface BackendMethods {
     args: [loop_enabled: boolean | null, loop_seconds: number | null];
     result: LedSettingsResult;
   };
+  get_cpu_status: { args: []; result: CpuStatusResult };
+  set_cpu_governor: { args: [governor: string]; result: CpuStatusResult };
+  get_cpu_settings: { args: []; result: CpuSettingsResult };
+  set_cpu_settings: { args: [restore_on_boot: boolean]; result: CpuSettingsResult };
   test_buzzer: { args: [level: BuzzerLevel]; result: BuzzerResult };
   stop_buzzer: { args: []; result: StopBuzzerResult };
 }
@@ -129,7 +156,7 @@ export enum BuzzerLevel {
   Long = 3,
 }
 
-export type TabId = "fan" | "led" | "buzzer";
+export type TabId = "fan" | "cpu" | "led" | "buzzer";
 
 export interface CuratedPreset {
   id: string;

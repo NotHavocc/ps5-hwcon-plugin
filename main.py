@@ -62,6 +62,10 @@ LED_LOOP_DEFAULT = 6
 LED_LOOP_TICK_SECONDS = 0.5
 LED_RETRIGGER_GAP_SECONDS = 0.05
 
+CPUFREQ_DIR = "/sys/devices/system/cpu/cpufreq"
+CPU_POLICY_PATTERN = re.compile(r"^policy(\d+)$")
+CPU_GOVERNOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
 BUZZER_DIR = "/sys/class/misc/ps5_buzzer"
 BUZZER_BEEP_PATH = "/sys/class/misc/ps5_buzzer/beep"
 BUZZER_STOP_PATH = "/sys/class/misc/ps5_buzzer/stop"
@@ -87,10 +91,13 @@ DEFAULT_SETTINGS = {
     "alarm_enabled": False,
     "led_loop_enabled": False,
     "led_loop_seconds": LED_LOOP_DEFAULT,
+    "cpu_restore_on_boot": False,
+    "saved_governor": None,
 }
 
 _fan_lock = asyncio.Lock()
 _led_lock = asyncio.Lock()
+_cpu_lock = asyncio.Lock()
 _buzzer_lock = asyncio.Lock()
 _settings_lock = asyncio.Lock()
 
@@ -282,6 +289,10 @@ def _sanitize_settings(raw):
     loop_seconds = _coerce_int(raw.get("led_loop_seconds"))
     if loop_seconds is not None and LED_LOOP_MIN <= loop_seconds <= LED_LOOP_MAX:
         settings["led_loop_seconds"] = loop_seconds
+    settings["cpu_restore_on_boot"] = raw.get("cpu_restore_on_boot") is True
+    governor = raw.get("saved_governor")
+    if isinstance(governor, str) and CPU_GOVERNOR_PATTERN.fullmatch(governor):
+        settings["saved_governor"] = governor
     return settings
 
 
@@ -323,6 +334,16 @@ async def _remember_target(target):
         if _settings["saved_target"] == target:
             return
         _settings["saved_target"] = target
+        ok, error = await _save_settings(dict(_settings))
+    if not ok:
+        logger.warning(error)
+
+
+async def _remember_governor(governor):
+    async with _settings_lock:
+        if _settings["saved_governor"] == governor:
+            return
+        _settings["saved_governor"] = governor
         ok, error = await _save_settings(dict(_settings))
     if not ok:
         logger.warning(error)
@@ -612,6 +633,121 @@ async def _discover_presets():
     return True, presets
 
 
+def _cpu_policy_dirs():
+    policies = []
+    for entry in os.listdir(CPUFREQ_DIR):
+        match = CPU_POLICY_PATTERN.fullmatch(entry)
+        if match:
+            policies.append((int(match.group(1)), os.path.join(CPUFREQ_DIR, entry)))
+    if not policies:
+        raise FileNotFoundError(errno.ENOENT, "No cpufreq policies", CPUFREQ_DIR)
+    return [path for _, path in sorted(policies)]
+
+
+def _read_policy_value(base, name):
+    try:
+        return _read_sysfs(os.path.join(base, name))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _read_policy_mhz(base, name):
+    khz = _coerce_int(_read_policy_value(base, name))
+    return round(khz / 1000) if khz is not None and khz > 0 else None
+
+
+def _scan_cpufreq():
+    governors = None
+    active = []
+    drivers = []
+    current = []
+    hw_min = []
+    hw_max = []
+    policies = _cpu_policy_dirs()
+
+    for base in policies:
+        names = (_read_policy_value(base, "scaling_available_governors") or "").split()
+        if governors is None:
+            governors = names
+        else:
+            governors = [g for g in governors if g in names]
+        governor = _read_policy_value(base, "scaling_governor")
+        if governor and governor not in active:
+            active.append(governor)
+        driver = _read_policy_value(base, "scaling_driver")
+        if driver and driver not in drivers:
+            drivers.append(driver)
+        for values, name in (
+            (current, "scaling_cur_freq"),
+            (hw_min, "cpuinfo_min_freq"),
+            (hw_max, "cpuinfo_max_freq"),
+        ):
+            mhz = _read_policy_mhz(base, name)
+            if mhz is not None:
+                values.append(mhz)
+
+    return {
+        "driver": ", ".join(drivers) or None,
+        "governors": [g for g in governors or [] if CPU_GOVERNOR_PATTERN.fullmatch(g)],
+        "active": active,
+        "policy_count": len(policies),
+        "freq_avg_mhz": round(sum(current) / len(current)) if current else None,
+        "freq_peak_mhz": max(current) if current else None,
+        "hw_min_mhz": min(hw_min) if hw_min else None,
+        "hw_max_mhz": max(hw_max) if hw_max else None,
+    }
+
+
+def _write_governor_sync(governor):
+    failures = []
+    for base in _cpu_policy_dirs():
+        try:
+            _write_sysfs(os.path.join(base, "scaling_governor"), governor)
+        except OSError as exc:
+            failures.append(exc)
+    if failures:
+        raise failures[0]
+
+
+async def _read_cpufreq():
+    if not os.path.isdir(CPUFREQ_DIR):
+        return False, (
+            f"{CPUFREQ_DIR} does not exist. No cpufreq driver is loaded "
+            "(check that amd_pstate or acpi-cpufreq is enabled in the kernel)"
+        )
+    ok, result = await _guarded_io("Reading CPU frequency", CPUFREQ_DIR, _scan_cpufreq)
+    if ok and not result["governors"]:
+        return False, f"The {result['driver'] or 'cpufreq'} driver exposes no governors"
+    return ok, result
+
+
+async def _apply_governor_locked(action, governor):
+    ok, status = await _read_cpufreq()
+    if not ok:
+        return False, status
+    if governor not in status["governors"]:
+        available = ", ".join(status["governors"])
+        return False, f"Governor '{governor}' is not available. The kernel offers: {available}"
+
+    ok, error = await _guarded_io(action, CPUFREQ_DIR, _write_governor_sync, governor)
+    if not ok:
+        return False, error
+    ok, confirmed = await _read_cpufreq()
+    if not ok:
+        return True, {**status, "active": [governor]}
+    status = confirmed
+    if status["active"] != [governor]:
+        return False, f"{action}: write accepted but CPUs report {', '.join(status['active'])}"
+    return True, status
+
+
+def _cpu_settings_snapshot():
+    return {
+        "restore_on_boot": _settings["cpu_restore_on_boot"],
+        "saved_governor": _settings["saved_governor"],
+    }
+
+
 async def _unload_hardware():
     if _guard["active"]:
         await _guard_release("plugin unloading")
@@ -811,6 +947,42 @@ class Plugin:
             return _fail(error)
         return _ok(f"LED preset '{preset}' applied", {"preset": preset, **_led_settings_snapshot()})
 
+    async def get_cpu_status(self):
+        async with _cpu_lock:
+            ok, result = await _read_cpufreq()
+        if not ok:
+            return _fail(result)
+        return _ok("CPU status updated", result, log=False)
+
+    async def set_cpu_governor(self, governor):
+        if not isinstance(governor, str) or not CPU_GOVERNOR_PATTERN.fullmatch(governor):
+            return _fail(f"Invalid governor name: {governor!r}")
+
+        async with _cpu_lock:
+            ok, result = await _apply_governor_locked("Setting CPU governor", governor)
+        if not ok:
+            return _fail(result)
+
+        await _remember_governor(governor)
+        return _ok(f"CPU governor set to {governor}", result)
+
+    async def get_cpu_settings(self):
+        return _ok("CPU settings loaded", _cpu_settings_snapshot(), log=False)
+
+    async def set_cpu_settings(self, restore_on_boot=None):
+        if not isinstance(restore_on_boot, bool):
+            return _fail(f"Invalid restore_on_boot value: {restore_on_boot!r}")
+
+        async with _settings_lock:
+            candidate = dict(_settings)
+            candidate["cpu_restore_on_boot"] = restore_on_boot
+            ok, error = await _save_settings(candidate)
+            if not ok:
+                return _fail(error)
+            _settings["cpu_restore_on_boot"] = restore_on_boot
+
+        return _ok("CPU settings saved", _cpu_settings_snapshot())
+
     async def test_buzzer(self, level):
         value = _coerce_int(level)
         if value not in BUZZER_LEVELS:
@@ -852,6 +1024,7 @@ class Plugin:
             ("Fan", FAN_TARGET_PATH),
             ("Temperature sensors", HWMON_DIR),
             ("LED class", LED_CLASS_DIR),
+            ("CPU frequency", CPUFREQ_DIR),
             ("Buzzer", BUZZER_DIR),
         ):
             if os.path.exists(path):
@@ -869,6 +1042,15 @@ class Plugin:
                 ok, result = await _write_fan_target_locked("Restoring fan target", saved)
             if ok:
                 logger.info(f"Restored fan target to {result} °C")
+            else:
+                logger.error(result)
+
+        governor = _settings["saved_governor"]
+        if _settings["cpu_restore_on_boot"] and governor and os.path.isdir(CPUFREQ_DIR):
+            async with _cpu_lock:
+                ok, result = await _apply_governor_locked("Restoring CPU governor", governor)
+            if ok:
+                logger.info(f"Restored CPU governor to {governor}")
             else:
                 logger.error(result)
 
