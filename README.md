@@ -49,6 +49,22 @@ This skips the build, so you don't need `git`, Node.js or podman.
 
 To update, install the newer zip the same way. Your settings are kept.
 
+### Install from a URL
+
+Decky can download the release zip itself, so you don't have to copy a file onto the PS5.
+
+1. In the Decky menu, open Settings (the gear icon).
+2. Under **General**, turn on **Developer mode**.
+3. Open the **Developer** section and choose **Install Plugin from URL**.
+4. Enter this URL and choose **Install**:
+
+   ```
+   https://github.com/NotHavocc/ps5-hwcon-plugin/releases/latest/download/ps5-hwcon-plugin.zip
+   ```
+
+This link always points to the newest release, so entering it again updates the plugin. Your settings are kept. To install a specific version, replace `latest/download` with `download/v1.1.0`
+(or another release tag).
+
 ### Requirements
 
 - A PS5 running Linux with the [ps5-linux-patches](https://github.com/rmuxnet/ps5-linux-patches-1) kernel booted. The plugin only talks to the sysfs interfaces that kernel adds.
