@@ -131,8 +131,15 @@ else
   for candidate in podman docker; do
     if command -v "$candidate" >/dev/null; then runtime="$candidate"; break; fi
   done
-  [ -n "$runtime" ] || die "Building needs Node.js, or podman/docker to run it in a container. Neither was found."
-  warn "Node.js not found, building inside $runtime ($NODE_IMAGE)"
+  if [ -z "$runtime" ]; then
+    if command -v node >/dev/null; then
+      hint="Node.js is installed but npm is not."
+      command -v pacman >/dev/null && hint="$hint Install it with: sudo pacman -S npm"
+      die "$hint (Or install podman/docker to build in a container.)"
+    fi
+    die "Building needs npm (Node.js), or podman/docker to run it in a container. Neither was found."
+  fi
+  warn "npm not found, building inside $runtime ($NODE_IMAGE)"
   "$runtime" run --rm -v "$SRC_DIR":/src:Z -w /src "$NODE_IMAGE" sh -c "$build_cmd"
 fi
 [ -f "$SRC_DIR/dist/index.js" ] || die "Build finished but dist/index.js is missing"
