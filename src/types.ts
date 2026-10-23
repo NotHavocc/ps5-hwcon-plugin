@@ -91,20 +91,41 @@ export interface CpuStatusData {
   freq_peak_mhz: number | null;
   hw_min_mhz: number | null;
   hw_max_mhz: number | null;
+  available_mhz: number[];
+  limit_min_mhz: number | null;
+  limit_max_mhz: number | null;
+  locked_mhz: number | null;
 }
 
 export interface CpuSettings {
   restore_on_boot: boolean;
   saved_governor: string | null;
+  saved_clock: number | null;
+}
+
+export interface GpuStatusData {
+  device: string;
+  governors: string[];
+  active: string | null;
+  freq_mhz: number | null;
+  target_mhz: number | null;
+  min_mhz: number | null;
+  max_mhz: number | null;
+  available_mhz: number[];
+  hw_min_mhz: number | null;
+  hw_max_mhz: number | null;
+  locked_mhz: number | null;
+}
+
+export interface GpuSettings {
+  restore_on_boot: boolean;
+  saved_governor: string | null;
+  saved_clock: number | null;
 }
 
 export interface GovernorInfo {
   label: string;
   description: string;
-}
-
-export interface BuzzerData {
-  level: number;
 }
 
 export type FanTargetResult = BackendResult<FanTargetData>;
@@ -116,8 +137,8 @@ export type LedPresetResult = BackendResult<LedPresetData>;
 export type LedSettingsResult = BackendResult<LedSettingsData>;
 export type CpuStatusResult = BackendResult<CpuStatusData>;
 export type CpuSettingsResult = BackendResult<CpuSettings>;
-export type BuzzerResult = BackendResult<BuzzerData>;
-export type StopBuzzerResult = BackendResult<null>;
+export type GpuStatusResult = BackendResult<GpuStatusData>;
+export type GpuSettingsResult = BackendResult<GpuSettings>;
 
 export type FanSettingsArgs = [
   restore_on_boot: boolean | null,
@@ -142,21 +163,19 @@ export interface BackendMethods {
   };
   get_cpu_status: { args: []; result: CpuStatusResult };
   set_cpu_governor: { args: [governor: string]; result: CpuStatusResult };
+  set_cpu_clock: { args: [mhz: number | null]; result: CpuStatusResult };
   get_cpu_settings: { args: []; result: CpuSettingsResult };
   set_cpu_settings: { args: [restore_on_boot: boolean]; result: CpuSettingsResult };
-  test_buzzer: { args: [level: BuzzerLevel]; result: BuzzerResult };
-  stop_buzzer: { args: []; result: StopBuzzerResult };
+  get_gpu_status: { args: []; result: GpuStatusResult };
+  set_gpu_governor: { args: [governor: string]; result: GpuStatusResult };
+  set_gpu_clock: { args: [mhz: number | null]; result: GpuStatusResult };
+  get_gpu_settings: { args: []; result: GpuSettingsResult };
+  set_gpu_settings: { args: [restore_on_boot: boolean]; result: GpuSettingsResult };
 }
 
 export type BackendMethod = keyof BackendMethods;
 
-export enum BuzzerLevel {
-  Short = 1,
-  Error = 2,
-  Long = 3,
-}
-
-export type TabId = "fan" | "cpu" | "led" | "buzzer";
+export type TabId = "fan" | "cpu" | "gpu" | "led";
 
 export interface CuratedPreset {
   id: string;

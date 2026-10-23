@@ -14,24 +14,23 @@ import {
 } from "@decky/ui";
 import { FC, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  FaBell,
+  FaCube,
   FaExclamationTriangle,
   FaLightbulb,
+  FaLock,
   FaMicrochip,
   FaRedo,
   FaShieldAlt,
-  FaStop,
   FaSyncAlt,
   FaTachometerAlt,
   FaThermometerHalf,
-  FaVolumeUp,
+  FaUnlock,
   FaWind,
 } from "react-icons/fa";
 import {
   BackendMethod,
   BackendMethods,
   BackendResult,
-  BuzzerLevel,
   CpuSettings,
   CpuStatusData,
   CuratedPreset,
@@ -41,6 +40,8 @@ import {
   FanStatusData,
   FanStatusResult,
   GovernorInfo,
+  GpuSettings,
+  GpuStatusData,
   LedSettingsData,
   TabId,
 } from "./types";
@@ -58,6 +59,8 @@ const GUARD_HYSTERESIS = 10;
 const LED_LOOP_MIN = 2;
 const LED_LOOP_MAX = 30;
 const LED_LOOP_DEFAULT = 6;
+const CPU_CLOCK_STEP = 100;
+const GPU_CLOCK_STEP = 25;
 const STATUS_POLL_MS = 2000;
 const THRESHOLD_SAVE_DELAY_MS = 600;
 const ACCENT = "#1a9fff";
@@ -151,12 +154,6 @@ const CURATED_PRESETS: CuratedPreset[] = [
   { id: "pink_breathe", label: "Pink Breathe" },
 ];
 
-const BUZZER_ACTIONS: { level: BuzzerLevel; label: string; description: string }[] = [
-  { level: BuzzerLevel.Short, label: "Short Beep", description: "Single short chirp" },
-  { level: BuzzerLevel.Error, label: "Error Beep", description: "System error pattern" },
-  { level: BuzzerLevel.Long, label: "Long Beep", description: "Sustained tone" },
-];
-
 const GOVERNORS: Record<string, GovernorInfo> = {
   performance: { label: "Performance", description: "Highest clocks" },
   powersave: { label: "Powersave", description: "Lowest clocks" },
@@ -172,11 +169,19 @@ const EPP_GOVERNORS: Record<string, GovernorInfo> = {
   powersave: { label: "Powersave", description: "Firmware managed" },
 };
 
+// devfreq governors, as exposed by the ps5-gpufreq driver.
+const GPU_GOVERNORS: Record<string, GovernorInfo> = {
+  simple_ondemand: { label: "Ondemand", description: "Follows GPU load" },
+  performance: { label: "Performance", description: "Highest clock" },
+  powersave: { label: "Powersave", description: "Lowest clock" },
+  userspace: { label: "Userspace", description: "Clock set by a program" },
+};
+
 const TABS: { id: TabId; label: string; icon: JSX.Element }[] = [
   { id: "fan", label: "Fan", icon: <FaWind /> },
   { id: "cpu", label: "CPU", icon: <FaTachometerAlt /> },
+  { id: "gpu", label: "GPU", icon: <FaCube /> },
   { id: "led", label: "LED", icon: <FaLightbulb /> },
-  { id: "buzzer", label: "Buzzer", icon: <FaVolumeUp /> },
 ];
 
 let lastTab: TabId = "fan";
@@ -209,6 +214,9 @@ const isEppDriver = (driver: string | null) =>
 const governorInfo = (id: string, driver: string | null): GovernorInfo =>
   (isEppDriver(driver) ? EPP_GOVERNORS[id] : undefined) ??
   GOVERNORS[id] ?? { label: prettifyPreset(id), description: "Kernel governor" };
+
+const gpuGovernorInfo = (id: string): GovernorInfo =>
+  GPU_GOVERNORS[id] ?? { label: prettifyPreset(id), description: "Kernel governor" };
 
 const InlineSpinner: FC = () => (
   <Spinner style={{ width: "1.2em", height: "1.2em", verticalAlign: "middle" }} />
@@ -243,6 +251,94 @@ const ButtonGrid: FC<{ columns: number; className?: string; children: ReactNode 
 
 const gridButtonClass = (index: number, count: number, columns: number) =>
   index === count - 1 && count % columns !== 0 ? "ps5hw-btn ps5hw-wide" : "ps5hw-btn";
+
+const nearest = (value: number, choices: number[]) =>
+  choices.reduce((best, choice) => (Math.abs(choice - value) < Math.abs(best - value) ? choice : best), value);
+
+const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
+
+const ClockLockSection: FC<{
+  description: string;
+  hwMin: number | null;
+  hwMax: number | null;
+  steps: number[];
+  fallbackStep: number;
+  locked: number | null;
+  busy: boolean;
+  applying: string | null;
+  onApply: (mhz: number | null) => Promise<void>;
+}> = ({ description, hwMin, hwMax, steps, fallbackStep, locked, busy, applying, onApply }) => {
+  const [slider, setSlider] = useState<number | null>(null);
+  const touched = useRef<boolean>(false);
+
+  useEffect(() => {
+    if (!touched.current && hwMin !== null && hwMax !== null) {
+      setSlider(clamp(nearest(locked ?? hwMax, steps), hwMin, hwMax));
+    }
+  }, [locked, hwMin, hwMax, steps]);
+
+  const apply = async (mhz: number | null) => {
+    await onApply(mhz);
+    touched.current = false;
+  };
+
+  if (hwMin === null || hwMax === null || hwMin >= hwMax || slider === null) {
+    return null;
+  }
+
+  // Uneven frequency tables still get a slider step that lands on every entry.
+  const step =
+    steps.length > 1 ? steps.slice(1).reduce((acc, mhz, i) => gcd(acc, mhz - steps[i]), 0) || fallbackStep : fallbackStep;
+
+  return (
+    <PanelSection title="Manual Clock">
+      <PanelSectionRow>
+        <Field label="Clock Lock" icon={locked !== null ? <FaLock /> : <FaUnlock />}>
+          {locked !== null ? formatFreq(locked) : "Automatic"}
+        </Field>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <SliderField
+          label="Clock (MHz)"
+          description={description}
+          value={slider}
+          min={hwMin}
+          max={hwMax}
+          step={step}
+          showValue
+          valueSuffix=" MHz"
+          resetValue={hwMax}
+          notchCount={2}
+          notchLabels={[
+            { notchIndex: 0, label: formatFreq(hwMin), value: hwMin },
+            { notchIndex: 1, label: formatFreq(hwMax), value: hwMax },
+          ]}
+          disabled={busy}
+          onChange={(value) => {
+            touched.current = true;
+            setSlider(steps.length ? nearest(value, steps) : value);
+          }}
+        />
+      </PanelSectionRow>
+      <ButtonGrid columns={2}>
+        <DialogButton
+          className="ps5hw-btn"
+          disabled={busy || slider === locked}
+          onClick={() => apply(slider)}
+        >
+          <ButtonLabel icon={<FaLock />} label="Lock Clock" busy={applying === "clock"} />
+        </DialogButton>
+        <DialogButton
+          className="ps5hw-btn"
+          disabled={busy || locked === null}
+          onClick={() => apply(null)}
+        >
+          <ButtonLabel icon={<FaUnlock />} label="Automatic" busy={applying === "clock-auto"} />
+        </DialogButton>
+      </ButtonGrid>
+    </PanelSection>
+  );
+};
 
 function useBackend() {
   const call = useCallback(
@@ -660,6 +756,21 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     refreshStatus();
   };
 
+  const applyClock = async (mhz: number | null) => {
+    setApplying(mhz === null ? "clock-auto" : "clock");
+    const result = await call("set_cpu_clock", mhz);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setSettings((prev) => (prev ? { ...prev, saved_clock: result.data.locked_mhz } : prev));
+    }
+    notify(result);
+    setApplying(null);
+    refreshStatus();
+  };
+
   const saveRestore = async (checked: boolean) => {
     setSavingSettings(true);
     const result = await call("set_cpu_settings", checked);
@@ -689,19 +800,25 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     governorValue = "Mixed";
   }
 
+  const locked = status?.locked_mhz ?? null;
   const freqDescription = [
     status?.freq_peak_mhz != null ? `Peak ${formatFreq(status.freq_peak_mhz)}` : null,
-    status?.hw_min_mhz != null && status?.hw_max_mhz != null
-      ? `Range ${formatFreq(status.hw_min_mhz)} – ${formatFreq(status.hw_max_mhz)}`
-      : null,
+    locked !== null
+      ? `Locked at ${formatFreq(locked)}`
+      : status?.hw_min_mhz != null && status?.hw_max_mhz != null
+        ? `Range ${formatFreq(status.hw_min_mhz)} – ${formatFreq(status.hw_max_mhz)}`
+        : null,
   ]
     .filter(Boolean)
     .join(" · ");
 
-  const restoreDescription =
-    settings?.saved_governor != null
-      ? `Re-applies ${governorInfo(settings.saved_governor, driver).label} when Decky starts. The kernel picks its default governor at boot.`
-      : "Re-applies your last governor when Decky starts. The kernel picks its default governor at boot.";
+  const savedParts = [
+    settings?.saved_governor != null ? governorInfo(settings.saved_governor, driver).label : null,
+    settings?.saved_clock != null ? `the ${formatFreq(settings.saved_clock)} clock lock` : null,
+  ].filter(Boolean);
+  const restoreDescription = savedParts.length
+    ? `Re-applies ${savedParts.join(" and ")} when Decky starts. The kernel picks its default governor and clock range at boot.`
+    : "Re-applies your last governor and clock lock when Decky starts. The kernel picks its default governor and clock range at boot.";
 
   return (
     <>
@@ -761,6 +878,223 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           ))}
         </PanelSection>
       )}
+      <ClockLockSection
+        description="Pins every CPU to this clock, whatever the governor."
+        hwMin={status?.hw_min_mhz ?? null}
+        hwMax={status?.hw_max_mhz ?? null}
+        steps={status?.available_mhz ?? []}
+        fallbackStep={CPU_CLOCK_STEP}
+        locked={locked}
+        busy={busy}
+        applying={applying}
+        onApply={applyClock}
+      />
+      <PanelSection title="Advanced">
+        <PanelSectionRow>
+          <ToggleField
+            label="Restore on Startup"
+            description={restoreDescription}
+            checked={settings?.restore_on_boot ?? false}
+            disabled={settings === null || savingSettings}
+            onChange={saveRestore}
+          />
+        </PanelSectionRow>
+      </PanelSection>
+    </>
+  );
+};
+
+const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const [status, setStatus] = useState<GpuStatusData | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [applying, setApplying] = useState<string | null>(null);
+  const [settings, setSettings] = useState<GpuSettings | null>(null);
+  const [savingSettings, setSavingSettings] = useState<boolean>(false);
+  const alive = useRef<boolean>(true);
+  const polling = useRef<boolean>(false);
+
+  const refreshStatus = useCallback(async () => {
+    if (polling.current) {
+      return null;
+    }
+    polling.current = true;
+    const result = await call("get_gpu_status");
+    polling.current = false;
+    if (!alive.current) {
+      return null;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setStatusError(null);
+    } else {
+      setStatusError(result.error);
+    }
+    return result;
+  }, [call]);
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const [statusResult, settingsResult] = await Promise.all([
+        refreshStatus(),
+        call("get_gpu_settings"),
+      ]);
+      if (!alive.current) {
+        return;
+      }
+      if (statusResult) {
+        notify(statusResult, true);
+      }
+      if (settingsResult.success) {
+        setSettings(settingsResult.data);
+      } else {
+        notify(settingsResult);
+      }
+    })();
+    const timer = window.setInterval(refreshStatus, STATUS_POLL_MS);
+    return () => {
+      alive.current = false;
+      window.clearInterval(timer);
+    };
+  }, [refreshStatus, call, notify]);
+
+  const applyGovernor = async (governor: string) => {
+    setApplying(governor);
+    const result = await call("set_gpu_governor", governor);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setSettings((prev) => (prev ? { ...prev, saved_governor: governor } : prev));
+    }
+    notify(result);
+    setApplying(null);
+    refreshStatus();
+  };
+
+  const applyClock = async (mhz: number | null) => {
+    setApplying(mhz === null ? "clock-auto" : "clock");
+    const result = await call("set_gpu_clock", mhz);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setSettings((prev) => (prev ? { ...prev, saved_clock: result.data.locked_mhz } : prev));
+    }
+    notify(result);
+    setApplying(null);
+    refreshStatus();
+  };
+
+  const saveRestore = async (checked: boolean) => {
+    setSavingSettings(true);
+    const result = await call("set_gpu_settings", checked);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setSettings(result.data);
+    }
+    notify(result, true);
+    setSavingSettings(false);
+  };
+
+  const loading = status === null && statusError === null;
+  const governors = status?.governors ?? [];
+  const current = status?.active ?? null;
+  const busy = applying !== null;
+
+  let governorValue: ReactNode = "Unavailable";
+  if (loading) {
+    governorValue = <InlineSpinner />;
+  } else if (current) {
+    governorValue = gpuGovernorInfo(current).label;
+  }
+
+  const locked = status?.locked_mhz ?? null;
+  const freqDescription = [
+    status?.target_mhz != null ? `Target ${formatFreq(status.target_mhz)}` : null,
+    locked !== null
+      ? `Locked at ${formatFreq(locked)}`
+      : status?.min_mhz != null && status?.max_mhz != null
+        ? `Range ${formatFreq(status.min_mhz)} – ${formatFreq(status.max_mhz)}`
+        : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  const savedParts = [
+    settings?.saved_governor != null ? gpuGovernorInfo(settings.saved_governor).label : null,
+    settings?.saved_clock != null ? `the ${formatFreq(settings.saved_clock)} clock lock` : null,
+  ].filter(Boolean);
+  const restoreDescription = savedParts.length
+    ? `Re-applies ${savedParts.join(" and ")} when Decky starts. The kernel starts the GPU on Ondemand at boot.`
+    : "Re-applies your last GPU governor and clock lock when Decky starts. The kernel starts the GPU on Ondemand at boot.";
+
+  return (
+    <>
+      <PanelSection title="GPU Frequency">
+        <PanelSectionRow>
+          <Field label="Governor" icon={<FaTachometerAlt />} description={statusError ?? undefined}>
+            {governorValue}
+          </Field>
+        </PanelSectionRow>
+        {status !== null && (
+          <>
+            <PanelSectionRow>
+              <Field label="Clock" icon={<FaCube />} description={freqDescription || undefined}>
+                {status.freq_mhz != null ? formatFreq(status.freq_mhz) : "Unknown"}
+              </Field>
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <Field label="Device">{status.device}</Field>
+            </PanelSectionRow>
+          </>
+        )}
+      </PanelSection>
+      {governors.length > 0 && (
+        <PanelSection title={`Governors (${governors.length})`}>
+          {chunk(governors, 2).map((row, rowIndex) => (
+            <ButtonGrid key={row.join("|")} columns={2}>
+              {row.map((id, index) => {
+                const info = gpuGovernorInfo(id);
+                return (
+                  <DialogButton
+                    key={id}
+                    className={gridButtonClass(rowIndex * 2 + index, governors.length, 2)}
+                    disabled={busy}
+                    onClick={() => applyGovernor(id)}
+                    style={{ borderBottom: `2px solid ${current === id ? ACCENT : "transparent"}` }}
+                  >
+                    {applying === id ? (
+                      <InlineSpinner />
+                    ) : (
+                      <div className="ps5hw-stack">
+                        <span>{info.label}</span>
+                        <span className="ps5hw-sub">{info.description}</span>
+                      </div>
+                    )}
+                  </DialogButton>
+                );
+              })}
+            </ButtonGrid>
+          ))}
+        </PanelSection>
+      )}
+      <ClockLockSection
+        description="Pins the GPU to this clock, whatever the governor. The firmware still overrides it while the CPU boosts."
+        hwMin={status?.hw_min_mhz ?? null}
+        hwMax={status?.hw_max_mhz ?? null}
+        steps={status?.available_mhz ?? []}
+        fallbackStep={GPU_CLOCK_STEP}
+        locked={locked}
+        busy={busy}
+        applying={applying}
+        onApply={applyClock}
+      />
       <PanelSection title="Advanced">
         <PanelSectionRow>
           <ToggleField
@@ -997,45 +1331,6 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   );
 };
 
-const BuzzerTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
-  const { call, notify } = backend;
-  const [pending, setPending] = useState<BuzzerLevel | "stop" | null>(null);
-
-  const beep = async (level: BuzzerLevel) => {
-    setPending(level);
-    notify(await call("test_buzzer", level));
-    setPending(null);
-  };
-
-  const stop = async () => {
-    setPending("stop");
-    notify(await call("stop_buzzer"));
-    setPending(null);
-  };
-
-  return (
-    <PanelSection title="Buzzer Test">
-      {BUZZER_ACTIONS.map((action) => (
-        <PanelSectionRow key={action.level}>
-          <ButtonItem
-            layout="below"
-            description={action.description}
-            disabled={pending !== null && pending !== "stop"}
-            onClick={() => beep(action.level)}
-          >
-            <ButtonLabel icon={<FaBell />} label={action.label} busy={pending === action.level} />
-          </ButtonItem>
-        </PanelSectionRow>
-      ))}
-      <PanelSectionRow>
-        <ButtonItem layout="below" disabled={pending === "stop"} onClick={stop}>
-          <ButtonLabel icon={<FaStop />} label="Stop Buzzer" busy={pending === "stop"} />
-        </ButtonItem>
-      </PanelSectionRow>
-    </PanelSection>
-  );
-};
-
 const Content: FC = () => {
   const backend = useBackend();
   const [tab, setTab] = useState<TabId>(lastTab);
@@ -1053,8 +1348,8 @@ const Content: FC = () => {
       </PanelSection>
       {tab === "fan" && <FanTab backend={backend} />}
       {tab === "cpu" && <CpuTab backend={backend} />}
+      {tab === "gpu" && <GpuTab backend={backend} />}
       {tab === "led" && <LedTab backend={backend} />}
-      {tab === "buzzer" && <BuzzerTab backend={backend} />}
     </>
   );
 };

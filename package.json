@@ -1,12 +1,12 @@
 {
   "name": "ps5-hardware-control",
-  "version": "1.1.0",
-  "description": "Decky Loader plugin for PS5 fan, LED and buzzer control on Linux",
+  "version": "1.2.0",
+  "description": "Decky Loader plugin for PS5 fan, CPU/GPU governor and LED control on Linux",
   "type": "module",
   "scripts": {
     "build": "rollup -c",
     "watch": "rollup -c -w",
-    "zip": "npm run build && rm -rf out && mkdir -p out/ps5-hardware-control && cp -R plugin.json package.json main.py README.md LICENSE dist out/ps5-hardware-control/ && cd out && zip -qr ps5-hardware-control.zip ps5-hardware-control -x '*.DS_Store'",
+    "zip": "npm run build && rm -rf out && mkdir -p out/ps5-hardware-control && cp -R plugin.json package.json main.py README.md LICENSE dist out/ps5-hardware-control/ && cd out && zip -qr ps5-hwcon-plugin.zip ps5-hardware-control -x '*.DS_Store'",
     "typecheck": "tsc --noEmit",
     "test": "echo \"Error: no test specified\" && exit 1"
   },

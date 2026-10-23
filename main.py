@@ -65,13 +65,19 @@ LED_RETRIGGER_GAP_SECONDS = 0.05
 CPUFREQ_DIR = "/sys/devices/system/cpu/cpufreq"
 CPU_POLICY_PATTERN = re.compile(r"^policy(\d+)$")
 CPU_GOVERNOR_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+CLOCK_MHZ_MIN = 1
+CLOCK_MHZ_MAX = 10000
+
+DEVFREQ_DIR = "/sys/class/devfreq"
+GPU_DEVFREQ_NAME = "ps5-gpufreq"
+GPU_DEVFREQ_PATH = f"{DEVFREQ_DIR}/{GPU_DEVFREQ_NAME}"
+# passive needs a parent devfreq device, which ps5-gpufreq doesn't have.
+GPU_HIDDEN_GOVERNORS = ("passive",)
 
 BUZZER_DIR = "/sys/class/misc/ps5_buzzer"
 BUZZER_BEEP_PATH = "/sys/class/misc/ps5_buzzer/beep"
-BUZZER_STOP_PATH = "/sys/class/misc/ps5_buzzer/stop"
 BUZZER_SILENT = 0
 BUZZER_ERROR = 2
-BUZZER_LEVELS = {1: "Short", 2: "Error", 3: "Long"}
 
 IO_TIMEOUT_SECONDS = 5.0
 UNLOAD_TIMEOUT_SECONDS = 3.0
@@ -93,11 +99,16 @@ DEFAULT_SETTINGS = {
     "led_loop_seconds": LED_LOOP_DEFAULT,
     "cpu_restore_on_boot": False,
     "saved_governor": None,
+    "gpu_restore_on_boot": False,
+    "saved_gpu_governor": None,
+    "saved_cpu_clock": None,
+    "saved_gpu_clock": None,
 }
 
 _fan_lock = asyncio.Lock()
 _led_lock = asyncio.Lock()
 _cpu_lock = asyncio.Lock()
+_gpu_lock = asyncio.Lock()
 _buzzer_lock = asyncio.Lock()
 _settings_lock = asyncio.Lock()
 
@@ -293,6 +304,14 @@ def _sanitize_settings(raw):
     governor = raw.get("saved_governor")
     if isinstance(governor, str) and CPU_GOVERNOR_PATTERN.fullmatch(governor):
         settings["saved_governor"] = governor
+    settings["gpu_restore_on_boot"] = raw.get("gpu_restore_on_boot") is True
+    gpu_governor = raw.get("saved_gpu_governor")
+    if isinstance(gpu_governor, str) and CPU_GOVERNOR_PATTERN.fullmatch(gpu_governor):
+        settings["saved_gpu_governor"] = gpu_governor
+    for key in ("saved_cpu_clock", "saved_gpu_clock"):
+        clock = _coerce_int(raw.get(key))
+        if clock is not None and CLOCK_MHZ_MIN <= clock <= CLOCK_MHZ_MAX:
+            settings[key] = clock
     return settings
 
 
@@ -329,21 +348,11 @@ async def _save_settings(settings):
         return False, f"Saving settings failed: unexpected error: {exc}"
 
 
-async def _remember_target(target):
+async def _remember_setting(key, value):
     async with _settings_lock:
-        if _settings["saved_target"] == target:
+        if _settings[key] == value:
             return
-        _settings["saved_target"] = target
-        ok, error = await _save_settings(dict(_settings))
-    if not ok:
-        logger.warning(error)
-
-
-async def _remember_governor(governor):
-    async with _settings_lock:
-        if _settings["saved_governor"] == governor:
-            return
-        _settings["saved_governor"] = governor
+        _settings[key] = value
         ok, error = await _save_settings(dict(_settings))
     if not ok:
         logger.warning(error)
@@ -656,13 +665,19 @@ def _read_policy_mhz(base, name):
     return round(khz / 1000) if khz is not None and khz > 0 else None
 
 
+def _nearest(value, choices):
+    return min(choices, key=lambda choice: (abs(choice - value), choice)) if choices else value
+
+
 def _scan_cpufreq():
     governors = None
+    available = None
     active = []
     drivers = []
     current = []
     hw_min = []
     hw_max = []
+    limits = []
     policies = _cpu_policy_dirs()
 
     for base in policies:
@@ -685,6 +700,19 @@ def _scan_cpufreq():
             mhz = _read_policy_mhz(base, name)
             if mhz is not None:
                 values.append(mhz)
+        limits.append(
+            (_read_policy_mhz(base, "scaling_min_freq"), _read_policy_mhz(base, "scaling_max_freq"))
+        )
+        listed = (_read_policy_value(base, "scaling_available_frequencies") or "").split()
+        steps = {round(khz / 1000) for khz in map(_coerce_int, listed) if khz is not None and khz > 0}
+        available = steps if available is None else available & steps
+
+    hw_range = (min(hw_min), max(hw_max)) if hw_min and hw_max else None
+    locked = None
+    if hw_range and hw_range[0] != hw_range[1] and len(set(limits)) == 1:
+        low, high = limits[0]
+        if low is not None and low == high:
+            locked = low
 
     return {
         "driver": ", ".join(drivers) or None,
@@ -695,7 +723,31 @@ def _scan_cpufreq():
         "freq_peak_mhz": max(current) if current else None,
         "hw_min_mhz": min(hw_min) if hw_min else None,
         "hw_max_mhz": max(hw_max) if hw_max else None,
+        "available_mhz": sorted(available or []),
+        "limit_min_mhz": min((low for low, _ in limits if low is not None), default=None),
+        "limit_max_mhz": max((high for _, high in limits if high is not None), default=None),
+        "locked_mhz": locked,
     }
+
+
+def _write_cpu_clock_sync(mhz):
+    # scaling_min_freq may never exceed scaling_max_freq, so widen, then narrow.
+    failures = []
+    for base in _cpu_policy_dirs():
+        hw_min = _read_sysfs(os.path.join(base, "cpuinfo_min_freq"))
+        hw_max = _read_sysfs(os.path.join(base, "cpuinfo_max_freq"))
+        if mhz is None:
+            writes = (("scaling_min_freq", hw_min), ("scaling_max_freq", hw_max))
+        else:
+            khz = mhz * 1000
+            writes = (("scaling_min_freq", hw_min), ("scaling_max_freq", khz), ("scaling_min_freq", khz))
+        try:
+            for name, value in writes:
+                _write_sysfs(os.path.join(base, name), value)
+        except OSError as exc:
+            failures.append(exc)
+    if failures:
+        raise failures[0]
 
 
 def _write_governor_sync(governor):
@@ -741,10 +793,155 @@ async def _apply_governor_locked(action, governor):
     return True, status
 
 
+async def _apply_cpu_clock_locked(action, mhz):
+    ok, status = await _read_cpufreq()
+    if not ok:
+        return False, status
+    if mhz is not None:
+        low, high = status["hw_min_mhz"], status["hw_max_mhz"]
+        if low is None or high is None:
+            return False, f"{action} failed: the CPU does not report its clock range"
+        if not low <= mhz <= high:
+            return False, f"{mhz} MHz is outside the CPU range {low}-{high} MHz"
+        mhz = _nearest(mhz, status["available_mhz"])
+
+    ok, error = await _guarded_io(action, CPUFREQ_DIR, _write_cpu_clock_sync, mhz)
+    if not ok:
+        return False, error
+    ok, confirmed = await _read_cpufreq()
+    if not ok:
+        return True, {**status, "locked_mhz": mhz}
+    if mhz is not None and confirmed["locked_mhz"] is None:
+        return False, (
+            f"{action}: write accepted but CPUs report "
+            f"{confirmed['limit_min_mhz']}-{confirmed['limit_max_mhz']} MHz"
+        )
+    return True, confirmed
+
+
+def _read_devfreq_mhz(base, name):
+    hz = _coerce_int(_read_policy_value(base, name))
+    return round(hz / 1_000_000) if hz is not None and hz > 0 else None
+
+
+def _scan_gpufreq():
+    base = GPU_DEVFREQ_PATH
+    if not os.path.isdir(base):
+        raise FileNotFoundError(errno.ENOENT, "No such device", base)
+    names = (_read_policy_value(base, "available_governors") or "").split()
+    listed = (_read_policy_value(base, "available_frequencies") or "").split()
+    available = sorted(
+        {round(hz / 1_000_000) for hz in map(_coerce_int, listed) if hz is not None and hz > 0}
+    )
+    min_mhz = _read_devfreq_mhz(base, "min_freq")
+    max_mhz = _read_devfreq_mhz(base, "max_freq")
+    locked = min_mhz if len(available) > 1 and min_mhz is not None and min_mhz == max_mhz else None
+    return {
+        "device": GPU_DEVFREQ_NAME,
+        "governors": [
+            g
+            for g in names
+            if CPU_GOVERNOR_PATTERN.fullmatch(g) and g not in GPU_HIDDEN_GOVERNORS
+        ],
+        "active": _read_policy_value(base, "governor"),
+        "freq_mhz": _read_devfreq_mhz(base, "cur_freq"),
+        "target_mhz": _read_devfreq_mhz(base, "target_freq"),
+        "min_mhz": min_mhz,
+        "max_mhz": max_mhz,
+        "available_mhz": available,
+        "hw_min_mhz": available[0] if available else None,
+        "hw_max_mhz": available[-1] if available else None,
+        "locked_mhz": locked,
+    }
+
+
+def _write_gpu_governor_sync(governor):
+    _write_sysfs(os.path.join(GPU_DEVFREQ_PATH, "governor"), governor)
+
+
+def _write_gpu_clock_sync(mhz):
+    # devfreq treats 0 as "no limit" for both bounds.
+    min_path = os.path.join(GPU_DEVFREQ_PATH, "min_freq")
+    max_path = os.path.join(GPU_DEVFREQ_PATH, "max_freq")
+    if mhz is None:
+        writes = ((min_path, 0), (max_path, 0))
+    else:
+        hz = mhz * 1_000_000
+        writes = ((min_path, 0), (max_path, hz), (min_path, hz))
+    for path, value in writes:
+        _write_sysfs(path, value)
+
+
+async def _read_gpufreq():
+    if not os.path.isdir(DEVFREQ_DIR):
+        return False, (
+            f"{DEVFREQ_DIR} does not exist. Is the ps5-linux-patches kernel "
+            "built with CONFIG_PS5_GPUFREQ?"
+        )
+    ok, result = await _guarded_io("Reading GPU frequency", GPU_DEVFREQ_PATH, _scan_gpufreq)
+    if ok and not result["governors"]:
+        return False, f"{GPU_DEVFREQ_NAME} exposes no governors"
+    return ok, result
+
+
+async def _apply_gpu_governor_locked(action, governor):
+    ok, status = await _read_gpufreq()
+    if not ok:
+        return False, status
+    if governor not in status["governors"]:
+        available = ", ".join(status["governors"])
+        return False, f"GPU governor '{governor}' is not available. The kernel offers: {available}"
+
+    ok, error = await _guarded_io(action, GPU_DEVFREQ_PATH, _write_gpu_governor_sync, governor)
+    if not ok:
+        return False, error
+    ok, confirmed = await _read_gpufreq()
+    if not ok:
+        return True, {**status, "active": governor}
+    if confirmed["active"] != governor:
+        return False, f"{action}: write accepted but the GPU reports {confirmed['active']}"
+    return True, confirmed
+
+
+async def _apply_gpu_clock_locked(action, mhz):
+    ok, status = await _read_gpufreq()
+    if not ok:
+        return False, status
+    if mhz is not None:
+        if not status["available_mhz"]:
+            return False, f"{GPU_DEVFREQ_NAME} does not list its available frequencies"
+        low, high = status["hw_min_mhz"], status["hw_max_mhz"]
+        if not low <= mhz <= high:
+            return False, f"{mhz} MHz is outside the GPU range {low}-{high} MHz"
+        mhz = _nearest(mhz, status["available_mhz"])
+
+    ok, error = await _guarded_io(action, GPU_DEVFREQ_PATH, _write_gpu_clock_sync, mhz)
+    if not ok:
+        return False, error
+    ok, confirmed = await _read_gpufreq()
+    if not ok:
+        return True, {**status, "locked_mhz": mhz}
+    if mhz is not None and confirmed["locked_mhz"] != mhz:
+        return False, (
+            f"{action}: write accepted but the GPU reports "
+            f"{confirmed['min_mhz']}-{confirmed['max_mhz']} MHz"
+        )
+    return True, confirmed
+
+
+def _gpu_settings_snapshot():
+    return {
+        "restore_on_boot": _settings["gpu_restore_on_boot"],
+        "saved_governor": _settings["saved_gpu_governor"],
+        "saved_clock": _settings["saved_gpu_clock"],
+    }
+
+
 def _cpu_settings_snapshot():
     return {
         "restore_on_boot": _settings["cpu_restore_on_boot"],
         "saved_governor": _settings["saved_governor"],
+        "saved_clock": _settings["saved_cpu_clock"],
     }
 
 
@@ -788,7 +985,7 @@ class Plugin:
                 if not ok:
                     return _fail(result)
 
-        await _remember_target(target)
+        await _remember_setting("saved_target", target)
         if deferred:
             return _ok(
                 f"Thermal guard is cooling. {target} °C will apply once the CPU cools down",
@@ -963,8 +1160,24 @@ class Plugin:
         if not ok:
             return _fail(result)
 
-        await _remember_governor(governor)
+        await _remember_setting("saved_governor", governor)
         return _ok(f"CPU governor set to {governor}", result)
+
+    async def set_cpu_clock(self, mhz):
+        clock = None if mhz is None else _coerce_int(mhz)
+        if mhz is not None and (clock is None or not CLOCK_MHZ_MIN <= clock <= CLOCK_MHZ_MAX):
+            return _fail(f"Invalid CPU clock: {mhz!r}")
+
+        async with _cpu_lock:
+            action = "Resetting CPU clock" if clock is None else "Locking CPU clock"
+            ok, result = await _apply_cpu_clock_locked(action, clock)
+        if not ok:
+            return _fail(result)
+
+        await _remember_setting("saved_cpu_clock", result["locked_mhz"])
+        if clock is None:
+            return _ok("CPU clock back to automatic", result)
+        return _ok(f"CPU clock locked at {result['locked_mhz']} MHz", result)
 
     async def get_cpu_settings(self):
         return _ok("CPU settings loaded", _cpu_settings_snapshot(), log=False)
@@ -983,39 +1196,57 @@ class Plugin:
 
         return _ok("CPU settings saved", _cpu_settings_snapshot())
 
-    async def test_buzzer(self, level):
-        value = _coerce_int(level)
-        if value not in BUZZER_LEVELS:
-            return _fail(f"Invalid buzzer level: {level!r}. Expected 1, 2 or 3")
-
-        async with _buzzer_lock:
-            ok, error = await _guarded_io(
-                f"{BUZZER_LEVELS[value]} beep",
-                BUZZER_BEEP_PATH,
-                _write_sysfs,
-                BUZZER_BEEP_PATH,
-                value,
-            )
+    async def get_gpu_status(self):
+        async with _gpu_lock:
+            ok, result = await _read_gpufreq()
         if not ok:
-            return _fail(error)
-        return _ok(f"{BUZZER_LEVELS[value]} beep sent", {"level": value})
+            return _fail(result)
+        return _ok("GPU status updated", result, log=False)
 
-    async def stop_buzzer(self):
-        async with _buzzer_lock:
-            stop_ok, stop_error = await _guarded_io(
-                "Stopping buzzer pattern", BUZZER_STOP_PATH, _write_sysfs, BUZZER_STOP_PATH, 1
-            )
-            silence_ok, silence_error = await _guarded_io(
-                "Silencing buzzer", BUZZER_BEEP_PATH, _write_sysfs, BUZZER_BEEP_PATH, BUZZER_SILENT
-            )
+    async def set_gpu_governor(self, governor):
+        if not isinstance(governor, str) or not CPU_GOVERNOR_PATTERN.fullmatch(governor):
+            return _fail(f"Invalid governor name: {governor!r}")
 
-        if silence_ok:
-            if not stop_ok:
-                logger.warning(stop_error)
-            return _ok("Buzzer stopped")
-        if stop_ok:
-            return _fail(f"Pattern stopped, but {silence_error}")
-        return _fail(f"{stop_error}; {silence_error}")
+        async with _gpu_lock:
+            ok, result = await _apply_gpu_governor_locked("Setting GPU governor", governor)
+        if not ok:
+            return _fail(result)
+
+        await _remember_setting("saved_gpu_governor", governor)
+        return _ok(f"GPU governor set to {governor}", result)
+
+    async def set_gpu_clock(self, mhz):
+        clock = None if mhz is None else _coerce_int(mhz)
+        if mhz is not None and (clock is None or not CLOCK_MHZ_MIN <= clock <= CLOCK_MHZ_MAX):
+            return _fail(f"Invalid GPU clock: {mhz!r}")
+
+        async with _gpu_lock:
+            action = "Resetting GPU clock" if clock is None else "Locking GPU clock"
+            ok, result = await _apply_gpu_clock_locked(action, clock)
+        if not ok:
+            return _fail(result)
+
+        await _remember_setting("saved_gpu_clock", result["locked_mhz"])
+        if clock is None:
+            return _ok("GPU clock back to automatic", result)
+        return _ok(f"GPU clock locked at {result['locked_mhz']} MHz", result)
+
+    async def get_gpu_settings(self):
+        return _ok("GPU settings loaded", _gpu_settings_snapshot(), log=False)
+
+    async def set_gpu_settings(self, restore_on_boot=None):
+        if not isinstance(restore_on_boot, bool):
+            return _fail(f"Invalid restore_on_boot value: {restore_on_boot!r}")
+
+        async with _settings_lock:
+            candidate = dict(_settings)
+            candidate["gpu_restore_on_boot"] = restore_on_boot
+            ok, error = await _save_settings(candidate)
+            if not ok:
+                return _fail(error)
+            _settings["gpu_restore_on_boot"] = restore_on_boot
+
+        return _ok("GPU settings saved", _gpu_settings_snapshot())
 
     async def _main(self):
         global _guard_task, _led_loop_task
@@ -1025,6 +1256,7 @@ class Plugin:
             ("Temperature sensors", HWMON_DIR),
             ("LED class", LED_CLASS_DIR),
             ("CPU frequency", CPUFREQ_DIR),
+            ("GPU frequency", GPU_DEVFREQ_PATH),
             ("Buzzer", BUZZER_DIR),
         ):
             if os.path.exists(path):
@@ -1051,6 +1283,35 @@ class Plugin:
                 ok, result = await _apply_governor_locked("Restoring CPU governor", governor)
             if ok:
                 logger.info(f"Restored CPU governor to {governor}")
+            else:
+                logger.error(result)
+
+        cpu_clock = _settings["saved_cpu_clock"]
+        if _settings["cpu_restore_on_boot"] and cpu_clock and os.path.isdir(CPUFREQ_DIR):
+            async with _cpu_lock:
+                ok, result = await _apply_cpu_clock_locked("Restoring CPU clock", cpu_clock)
+            if ok:
+                logger.info(f"Restored CPU clock lock at {result['locked_mhz']} MHz")
+            else:
+                logger.error(result)
+
+        gpu_governor = _settings["saved_gpu_governor"]
+        if _settings["gpu_restore_on_boot"] and gpu_governor and os.path.isdir(GPU_DEVFREQ_PATH):
+            async with _gpu_lock:
+                ok, result = await _apply_gpu_governor_locked(
+                    "Restoring GPU governor", gpu_governor
+                )
+            if ok:
+                logger.info(f"Restored GPU governor to {gpu_governor}")
+            else:
+                logger.error(result)
+
+        gpu_clock = _settings["saved_gpu_clock"]
+        if _settings["gpu_restore_on_boot"] and gpu_clock and os.path.isdir(GPU_DEVFREQ_PATH):
+            async with _gpu_lock:
+                ok, result = await _apply_gpu_clock_locked("Restoring GPU clock", gpu_clock)
+            if ok:
+                logger.info(f"Restored GPU clock lock at {result['locked_mhz']} MHz")
             else:
                 logger.error(result)
 

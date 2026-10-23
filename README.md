@@ -1,17 +1,17 @@
 <h1 align="center">ps5-hwcon-plugin</h1>
 
 <p align="center">
-  <img src="docs/screenshot-fan.png" alt="Fan tab" width="23%">
+  <img src="docs/screenshot-fan.png" alt="Fan tab" width="22%">
   &nbsp;
-  <img src="docs/screenshot-cpu.png" alt="CPU tab" width="23%">
+  <img src="docs/screenshot-cpu.png" alt="CPU tab" width="22%">
   &nbsp;
-  <img src="docs/screenshot-led.png" alt="LED tab" width="23%">
+  <img src="docs/screenshot-gpu.png" alt="GPU tab" width="22%">
   &nbsp;
-  <img src="docs/screenshot-buzzer.png" alt="Buzzer tab" width="23%">
+  <img src="docs/screenshot-led.png" alt="LED tab" width="22%">
 </p>
 
 <p align="center">
-  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan target temperature, live temperatures, CPU governor, indicator LED presets and the chassis buzzer, all from the Quick Access Menu.
+  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan target temperature, live temperatures, CPU and GPU governors and clocks, and indicator LED presets, all from the Quick Access Menu.
 </p>
 
 ---
@@ -62,7 +62,7 @@ Decky can download the release zip itself, so you don't have to copy a file onto
    https://github.com/NotHavocc/ps5-hwcon-plugin/releases/latest/download/ps5-hwcon-plugin.zip
    ```
 
-This link always points to the newest release, so entering it again updates the plugin. Your settings are kept. To install a specific version, replace `latest/download` with `download/v1.1.0` (or another release tag).
+This link always points to the newest release, so entering it again updates the plugin. Your settings are kept. To install a specific version, replace `latest/download` with `download/v1.2.0` (or another release tag).
 
 ### Requirements
 
@@ -87,19 +87,25 @@ Thermal Guard and Overheat Alarm run in the background, even with the menu close
 
 - **Governor**: lists every cpufreq governor the kernel offers (`scaling_available_governors`) and applies your choice to all CPUs. Only governors built into or loaded by the kernel are shown.
 - **Status**: active governor, average and peak clock, hardware range and the cpufreq driver, refreshed every 2 s. If CPUs disagree, it shows **Mixed**.
-- **Restore on Startup**: re-applies your last governor when Decky starts.
+- **Manual Clock**: locks every CPU to one clock by setting `scaling_min_freq` and `scaling_max_freq` to the same value. The slider covers the hardware range and snaps to `scaling_available_frequencies` when the driver lists them. The lock applies under any governor. **Automatic** restores the full range.
+- **Restore on Startup**: re-applies your last governor and clock lock when Decky starts.
 
 With an EPP driver such as `amd-pstate-epp`, the kernel only offers Performance and Powersave. The firmware still manages clocks under Powersave.
+
+### GPU
+
+- **Governor**: lists the devfreq governors the `ps5-gpufreq` driver offers (`/sys/class/devfreq/ps5-gpufreq/available_governors`): Ondemand (`simple_ondemand`, the kernel default), Performance, Powersave and Userspace.
+- **Status**: active governor, current GPU clock, target clock and the allowed range, refreshed every 2 s.
+- **Manual Clock**: locks the GPU to one of the frequencies in `available_frequencies` by setting the devfreq `min_freq` and `max_freq` to the same value. The lock applies under any governor. **Automatic** removes both limits.
+- **Restore on Startup**: re-applies your last GPU governor and clock lock when Decky starts.
+
+GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ` (ps5-linux-patches, October 2026 or newer). While the CPU runs at a boost clock (3.3–3.5 GHz), the firmware takes over the GPU clock and holds it at the 2.23 GHz ceiling, regardless of the GPU governor or clock lock.
 
 ### LED
 
 - Quick buttons for Off, White Bright, Blue Rich, Purple, Orange Breathe and Pink Breathe.
 - A searchable list of every preset the kernel exposes.
 - **Loop Animations**: the firmware plays breathe and pulse animations once. This option replays them on an interval you choose (2–30 s), and keeps going in the background.
-
-### Buzzer
-
-- Short, Error and Long test beeps, plus Stop.
 
 ## Credits
 

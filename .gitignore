@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Plugin settings written when running main.py outside Decky
+settings.json
+settings.json.tmp
+
+# Logs
+npm-debug.log*
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store

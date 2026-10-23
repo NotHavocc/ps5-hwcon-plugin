@@ -11,10 +11,11 @@
       "ps5",
       "fan",
       "cpu",
+      "gpu",
       "led",
       "root"
     ],
-    "description": "Control the PlayStation 5 fan target temperature, CPU governor, indicator LED presets and chassis buzzer on Linux.",
+    "description": "Control the PlayStation 5 fan target temperature, CPU and GPU governors and clocks, and indicator LED presets on Linux.",
     "image": ""
   }
 }
