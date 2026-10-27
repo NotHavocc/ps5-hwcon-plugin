@@ -1182,9 +1182,13 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     setPending(null);
   };
 
-  const saveLoop = async (enabled: boolean | null, seconds: number | null) => {
+  const saveLoop = async (
+    enabled: boolean | null,
+    seconds: number | null,
+    restore: boolean | null = null,
+  ) => {
     setSavingLoop(true);
-    const result = await call("set_led_settings", enabled, seconds);
+    const result = await call("set_led_settings", enabled, seconds, restore);
     if (!alive.current) {
       return;
     }
@@ -1219,6 +1223,11 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   } else if (loopEnabled) {
     loopStatus = "Waiting for an animated preset";
   }
+
+  const savedPreset = loop?.saved_preset ?? null;
+  const restoreDescription = savedPreset
+    ? `Re-applies ${prettifyPreset(savedPreset)} when Decky starts. The kernel picks its default LED at boot.`
+    : "Re-applies your last LED preset when Decky starts. The kernel picks its default LED at boot.";
 
   const presetDescription = (id: string) => {
     const tags: string[] = [];
@@ -1295,6 +1304,17 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           <Field label="Loop Status" icon={<FaRedo />}>
             {loopStatus}
           </Field>
+        </PanelSectionRow>
+      </PanelSection>
+      <PanelSection title="Advanced">
+        <PanelSectionRow>
+          <ToggleField
+            label="Restore on Startup"
+            description={restoreDescription}
+            checked={loop?.restore_on_boot ?? false}
+            disabled={loop === null || savingLoop}
+            onChange={(checked) => saveLoop(null, null, checked)}
+          />
         </PanelSectionRow>
       </PanelSection>
       {presets !== null && presets.length > 0 && (

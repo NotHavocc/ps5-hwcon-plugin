@@ -62,7 +62,7 @@ Decky can download the release zip itself, so you don't have to copy a file onto
    https://github.com/NotHavocc/ps5-hwcon-plugin/releases/latest/download/ps5-hwcon-plugin.zip
    ```
 
-This link always points to the newest release, so entering it again updates the plugin. Your settings are kept. To install a specific version, replace `latest/download` with `download/v1.2.0` (or another release tag).
+This link always points to the newest release, so entering it again updates the plugin. Your settings are kept. To install a specific version, replace `latest/download` with `download/v1.3.0` (or another release tag).
 
 ### Requirements
 
@@ -106,6 +106,7 @@ GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ` (ps5-linux-patches, 
 - Quick buttons for Off, White Bright, Blue Rich, Purple, Orange Breathe and Pink Breathe.
 - A searchable list of every preset the kernel exposes.
 - **Loop Animations**: the firmware plays breathe and pulse animations once. This option replays them on an interval you choose (2–30 s), and keeps going in the background.
+- **Restore on Startup**: re-applies your last LED preset when Decky starts.
 
 ## Credits
 

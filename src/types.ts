@@ -76,6 +76,8 @@ export interface LedSettingsData {
   loop_seconds: number;
   preset: string | null;
   looping: boolean;
+  restore_on_boot: boolean;
+  saved_preset: string | null;
 }
 
 export interface LedPresetData extends LedSettingsData {
@@ -158,7 +160,11 @@ export interface BackendMethods {
   set_led_preset: { args: [preset: string]; result: LedPresetResult };
   get_led_settings: { args: []; result: LedSettingsResult };
   set_led_settings: {
-    args: [loop_enabled: boolean | null, loop_seconds: number | null];
+    args: [
+      loop_enabled: boolean | null,
+      loop_seconds: number | null,
+      restore_on_boot: boolean | null,
+    ];
     result: LedSettingsResult;
   };
   get_cpu_status: { args: []; result: CpuStatusResult };

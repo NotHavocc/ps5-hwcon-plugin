@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import gzip
 import json
 import os
 import re
@@ -71,6 +72,7 @@ CLOCK_MHZ_MAX = 10000
 DEVFREQ_DIR = "/sys/class/devfreq"
 GPU_DEVFREQ_NAME = "ps5-gpufreq"
 GPU_DEVFREQ_PATH = f"{DEVFREQ_DIR}/{GPU_DEVFREQ_NAME}"
+GPU_KCONFIG_OPTION = "CONFIG_PS5_GPUFREQ"
 # passive needs a parent devfreq device, which ps5-gpufreq doesn't have.
 GPU_HIDDEN_GOVERNORS = ("passive",)
 
@@ -97,6 +99,8 @@ DEFAULT_SETTINGS = {
     "alarm_enabled": False,
     "led_loop_enabled": False,
     "led_loop_seconds": LED_LOOP_DEFAULT,
+    "led_restore_on_boot": False,
+    "saved_led_preset": None,
     "cpu_restore_on_boot": False,
     "saved_governor": None,
     "gpu_restore_on_boot": False,
@@ -300,6 +304,10 @@ def _sanitize_settings(raw):
     loop_seconds = _coerce_int(raw.get("led_loop_seconds"))
     if loop_seconds is not None and LED_LOOP_MIN <= loop_seconds <= LED_LOOP_MAX:
         settings["led_loop_seconds"] = loop_seconds
+    settings["led_restore_on_boot"] = raw.get("led_restore_on_boot") is True
+    led_preset = raw.get("saved_led_preset")
+    if isinstance(led_preset, str) and LED_PRESET_PATTERN.fullmatch(led_preset):
+        settings["saved_led_preset"] = led_preset
     settings["cpu_restore_on_boot"] = raw.get("cpu_restore_on_boot") is True
     governor = raw.get("saved_governor")
     if isinstance(governor, str) and CPU_GOVERNOR_PATTERN.fullmatch(governor):
@@ -502,6 +510,8 @@ def _led_settings_snapshot():
         "loop_seconds": _settings["led_loop_seconds"],
         "preset": _led["preset"],
         "looping": _settings["led_loop_enabled"] and _is_animated(_led["preset"]),
+        "restore_on_boot": _settings["led_restore_on_boot"],
+        "saved_preset": _settings["saved_led_preset"],
     }
 
 
@@ -640,6 +650,29 @@ async def _discover_presets():
             "Is the ps5-led driver loaded in the ps5-linux-patches kernel?"
         )
     return True, presets
+
+
+async def _apply_led_preset_locked(action, preset):
+    ok, available = await _discover_presets()
+    if not ok:
+        return False, available
+
+    if preset in available:
+        path = _led_brightness_path(preset)
+        value = 1
+    elif preset == LED_OFF_PRESET:
+        path = _led_brightness_path(available[0])
+        value = 0
+    else:
+        return False, f"Preset '{preset}' is not exposed by the kernel"
+
+    ok, error = await _guarded_io(f"{action} '{preset}'", path, _write_sysfs, path, value)
+    if not ok:
+        return False, error
+    _led["preset"] = preset
+    _led["started"] = time.monotonic()
+    _led["error_logged"] = False
+    return True, None
 
 
 def _cpu_policy_dirs():
@@ -872,12 +905,65 @@ def _write_gpu_clock_sync(mhz):
         _write_sysfs(path, value)
 
 
-async def _read_gpufreq():
-    if not os.path.isdir(DEVFREQ_DIR):
-        return False, (
-            f"{DEVFREQ_DIR} does not exist. Is the ps5-linux-patches kernel "
-            "built with CONFIG_PS5_GPUFREQ?"
+def _kernel_config_paths():
+    release = os.uname().release
+    return (
+        "/proc/config.gz",
+        f"/boot/config-{release}",
+        f"/usr/lib/modules/{release}/config",
+        f"/lib/modules/{release}/config",
+    )
+
+
+def _read_kernel_option_sync(option):
+    """Returns 'y', 'm', 'n', or None when no kernel config is readable."""
+    prefix = f"{option}="
+    unset = f"# {option} is not set"
+    for path in _kernel_config_paths():
+        opener = gzip.open if path.endswith(".gz") else open
+        try:
+            with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if line.startswith(prefix):
+                        return line[len(prefix) :].strip('"')
+                    if line == unset:
+                        return "n"
+        except (OSError, EOFError):
+            continue
+        return "n"
+    return None
+
+
+async def _describe_missing_gpufreq():
+    try:
+        value = await asyncio.wait_for(
+            _run_detached(_read_kernel_option_sync, GPU_KCONFIG_OPTION),
+            timeout=IO_TIMEOUT_SECONDS,
         )
+    except Exception:
+        value = None
+    if value == "n":
+        return (
+            f"This kernel was built without {GPU_KCONFIG_OPTION}. "
+            "Install a ps5-linux-patches kernel that enables it."
+        )
+    if value == "m":
+        return (
+            f"{GPU_KCONFIG_OPTION} is a module, but {GPU_DEVFREQ_NAME} is not registered. "
+            "Is the module loaded?"
+        )
+    if value == "y":
+        return (
+            f"{GPU_KCONFIG_OPTION} is built in, but {GPU_DEVFREQ_NAME} is not registered. "
+            "Check dmesg for probe errors."
+        )
+    return f"{GPU_DEVFREQ_PATH} does not exist. Is the kernel built with {GPU_KCONFIG_OPTION}?"
+
+
+async def _read_gpufreq():
+    if not os.path.isdir(GPU_DEVFREQ_PATH):
+        return False, await _describe_missing_gpufreq()
     ok, result = await _guarded_io("Reading GPU frequency", GPU_DEVFREQ_PATH, _scan_gpufreq)
     if ok and not result["governors"]:
         return False, f"{GPU_DEVFREQ_NAME} exposes no governors"
@@ -1089,7 +1175,7 @@ class Plugin:
     async def get_led_settings(self):
         return _ok("LED settings loaded", _led_settings_snapshot(), log=False)
 
-    async def set_led_settings(self, loop_enabled=None, loop_seconds=None):
+    async def set_led_settings(self, loop_enabled=None, loop_seconds=None, restore_on_boot=None):
         updates = {}
         if loop_enabled is not None:
             if not isinstance(loop_enabled, bool):
@@ -1102,6 +1188,10 @@ class Plugin:
                     f"Loop interval must be between {LED_LOOP_MIN} and {LED_LOOP_MAX} seconds"
                 )
             updates["led_loop_seconds"] = seconds
+        if restore_on_boot is not None:
+            if not isinstance(restore_on_boot, bool):
+                return _fail(f"Invalid restore_on_boot value: {restore_on_boot!r}")
+            updates["led_restore_on_boot"] = restore_on_boot
         if not updates:
             return _fail("No settings provided")
 
@@ -1120,28 +1210,11 @@ class Plugin:
             return _fail(f"Invalid preset name: {preset!r}")
 
         async with _led_lock:
-            ok, available = await _discover_presets()
-            if not ok:
-                return _fail(available)
-
-            if preset in available:
-                path = _led_brightness_path(preset)
-                value = 1
-            elif preset == LED_OFF_PRESET:
-                path = _led_brightness_path(available[0])
-                value = 0
-            else:
-                return _fail(f"Preset '{preset}' is not exposed by the kernel")
-
-            ok, error = await _guarded_io(
-                f"Applying LED preset '{preset}'", path, _write_sysfs, path, value
-            )
-            if ok:
-                _led["preset"] = preset
-                _led["started"] = time.monotonic()
-                _led["error_logged"] = False
+            ok, error = await _apply_led_preset_locked("Applying LED preset", preset)
         if not ok:
             return _fail(error)
+
+        await _remember_setting("saved_led_preset", preset)
         return _ok(f"LED preset '{preset}' applied", {"preset": preset, **_led_settings_snapshot()})
 
     async def get_cpu_status(self):
@@ -1263,6 +1336,8 @@ class Plugin:
                 logger.info(f"{label} interface found at {path}")
             else:
                 logger.warning(f"{label} interface missing at {path}")
+        if not os.path.isdir(GPU_DEVFREQ_PATH):
+            logger.warning(await _describe_missing_gpufreq())
 
         loaded = await _run_detached(_load_settings_sync)
         async with _settings_lock:
@@ -1314,6 +1389,15 @@ class Plugin:
                 logger.info(f"Restored GPU clock lock at {result['locked_mhz']} MHz")
             else:
                 logger.error(result)
+
+        led_preset = _settings["saved_led_preset"]
+        if _settings["led_restore_on_boot"] and led_preset and os.path.isdir(LED_CLASS_DIR):
+            async with _led_lock:
+                ok, error = await _apply_led_preset_locked("Restoring LED preset", led_preset)
+            if ok:
+                logger.info(f"Restored LED preset '{led_preset}'")
+            else:
+                logger.error(error)
 
         _guard_task = asyncio.create_task(_guard_loop())
         _led_loop_task = asyncio.create_task(_led_loop())
