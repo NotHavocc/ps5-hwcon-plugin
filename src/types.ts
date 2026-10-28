@@ -13,7 +13,25 @@ export type BackendResult<T = null> = BackendSuccess<T> | BackendFailure;
 
 export interface FanTargetData {
   temp: number;
+  curve?: FanCurve;
+  mode?: number;
 }
+
+export interface FanCurve {
+  points: [number, number][];
+  stop: number;
+}
+
+export interface FanHwmonStatus {
+  curve: FanCurve;
+  mode: number | null;
+  pwm: number | null;
+  temp: number | null;
+}
+
+export type FanInterface = "curve" | "target";
+
+export type FanUpdateData = Partial<FanHwmonStatus> | null;
 
 export interface TemperatureSensor {
   id: string;
@@ -30,15 +48,20 @@ export interface GuardState {
   enabled: boolean;
   active: boolean;
   threshold: number;
+  kind: FanInterface | null;
   restore_target: number | null;
+  restore_mode: number | null;
   cpu: number | null;
   alarm_enabled: boolean;
   alarm_active: boolean;
 }
 
 export interface FanStatusData {
+  interface: FanInterface | null;
   target: number | null;
   target_error: string | null;
+  fan: FanHwmonStatus | null;
+  fan_error: string | null;
   sensors: TemperatureSensor[];
   guard: GuardState;
 }
@@ -49,6 +72,7 @@ export interface FanSettings {
   guard_threshold: number;
   alarm_enabled: boolean;
   saved_target: number | null;
+  saved_curve: FanCurve | null;
 }
 
 export type FanSettingsUpdate = Partial<
@@ -65,6 +89,15 @@ export interface FanPreset {
   label: string;
   temp: number;
 }
+
+export interface FanCurvePreset {
+  id: string;
+  label: string;
+  subtitle: string;
+  curve: FanCurve | null;
+}
+
+export type FanView = "target" | "curve";
 
 export interface LedPresetsData {
   presets: string[];
@@ -131,6 +164,7 @@ export interface GovernorInfo {
 }
 
 export type FanTargetResult = BackendResult<FanTargetData>;
+export type FanUpdateResult = BackendResult<FanUpdateData>;
 export type TemperaturesResult = BackendResult<TemperaturesData>;
 export type FanStatusResult = BackendResult<FanStatusData>;
 export type FanSettingsResult = BackendResult<FanSettingsData>;
@@ -154,6 +188,9 @@ export interface BackendMethods {
   set_fan_target: { args: [temp: number]; result: FanTargetResult };
   get_temperatures: { args: []; result: TemperaturesResult };
   get_fan_status: { args: []; result: FanStatusResult };
+  set_fan_curve: { args: [curve: FanCurve]; result: FanUpdateResult };
+  reset_fan_curve: { args: []; result: FanUpdateResult };
+  set_fan_mode: { args: [mode: number]; result: FanUpdateResult };
   get_fan_settings: { args: []; result: FanSettingsResult };
   set_fan_settings: { args: FanSettingsArgs; result: FanSettingsResult };
   get_led_presets: { args: []; result: LedPresetsResult };

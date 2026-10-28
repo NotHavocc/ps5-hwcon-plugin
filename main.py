@@ -31,8 +31,21 @@ FAN_SAFE_MAX = 90
 FAN_BOOT_TARGET = 80
 FAN_MAX_COOLING_TARGET = 50
 
+FAN_HWMON_NAME = "ps5_fan"
+FAN_HWMON_DESC = f"the {FAN_HWMON_NAME} hwmon device"
+FAN_CURVE_POINTS = 8
+FAN_CURVE_TEMP_MAX = 90
+FAN_PWM_MAX = 255
+FAN_MODE_FULL = 0
+FAN_MODE_MANUAL = 1
+FAN_MODE_CURVE = 2
+
+FAN_TARGET_CURVE_OFFSETS = (-12, -8, -5, -2, 0, 2, 4, 6)
+FAN_TARGET_CURVE_PERCENT = (10, 15, 22, 32, 45, 60, 80, 100)
+FAN_TARGET_CURVE_STOP_GAP = 5
+
 HWMON_DIR = "/sys/class/hwmon"
-HWMON_CHIP_PRIORITY = {"k10temp": 0, "amdgpu": 1, "nvme": 2}
+HWMON_CHIP_PRIORITY = {"k10temp": 0, "ps5_fan": 1, "amdgpu": 2, "nvme": 3}
 CPU_SENSOR_CHIP = "k10temp"
 SENSOR_LABELS = {
     ("k10temp", "Tctl"): "CPU",
@@ -41,6 +54,10 @@ SENSOR_LABELS = {
     ("amdgpu", "junction"): "GPU Junction",
     ("amdgpu", "mem"): "GPU Memory",
     ("nvme", "Composite"): "SSD",
+    ("ps5_fan", "MainSoC"): "SoC",
+    ("ps5_fan", "Local1"): "Local 1",
+    ("ps5_fan", "Local2"): "Local 2",
+    ("ps5_fan", "Local3"): "Local 3",
 }
 SENSOR_PLAUSIBLE_MIN = -20.0
 SENSOR_PLAUSIBLE_MAX = 150.0
@@ -73,7 +90,6 @@ DEVFREQ_DIR = "/sys/class/devfreq"
 GPU_DEVFREQ_NAME = "ps5-gpufreq"
 GPU_DEVFREQ_PATH = f"{DEVFREQ_DIR}/{GPU_DEVFREQ_NAME}"
 GPU_KCONFIG_OPTION = "CONFIG_PS5_GPUFREQ"
-# passive needs a parent devfreq device, which ps5-gpufreq doesn't have.
 GPU_HIDDEN_GOVERNORS = ("passive",)
 
 BUZZER_DIR = "/sys/class/misc/ps5_buzzer"
@@ -83,6 +99,8 @@ BUZZER_ERROR = 2
 
 IO_TIMEOUT_SECONDS = 5.0
 UNLOAD_TIMEOUT_SECONDS = 3.0
+RESTORE_TIMEOUT_SECONDS = 60.0
+RESTORE_RETRY_SECONDS = 2.0
 LS_CANDIDATES = ("/usr/bin/ls", "/bin/ls")
 
 SETTINGS_DIR = os.path.abspath(
@@ -94,6 +112,7 @@ SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 DEFAULT_SETTINGS = {
     "restore_on_boot": False,
     "saved_target": None,
+    "saved_curve": None,
     "guard_enabled": False,
     "guard_threshold": GUARD_DEFAULT,
     "alarm_enabled": False,
@@ -117,11 +136,13 @@ _buzzer_lock = asyncio.Lock()
 _settings_lock = asyncio.Lock()
 
 _settings = dict(DEFAULT_SETTINGS)
-_guard = {"active": False, "restore_target": None, "cpu": None}
+_guard = {"active": False, "kind": None, "restore_target": None, "restore_mode": None, "cpu": None}
 _alarm = {"active": False}
 _led = {"preset": None, "started": 0.0, "error_logged": False}
 _guard_task = None
 _led_loop_task = None
+_restore_task = None
+_settings_loaded = False
 
 
 def _ok(message, data=None, log=True):
@@ -282,6 +303,163 @@ async def _read_temperatures():
         return []
 
 
+def _sanitize_curve(raw):
+    if not isinstance(raw, dict):
+        return None, "expected an object"
+    points = raw.get("points")
+    stop = _coerce_int(raw.get("stop"))
+    if not isinstance(points, (list, tuple)) or len(points) != FAN_CURVE_POINTS:
+        return None, f"expected {FAN_CURVE_POINTS} points"
+    if stop is None:
+        return None, "missing stop temperature"
+    clean = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            return None, "each point must be [temperature, pwm]"
+        temp, pwm = (_coerce_int(value) for value in point)
+        if temp is None or pwm is None:
+            return None, "point values must be integers"
+        if not 0 <= temp <= FAN_CURVE_TEMP_MAX:
+            return None, f"temperatures must be 0-{FAN_CURVE_TEMP_MAX} °C"
+        if not 0 <= pwm <= FAN_PWM_MAX:
+            return None, f"PWM values must be 0-{FAN_PWM_MAX}"
+        clean.append([temp, pwm])
+    if not 0 <= stop < clean[0][0]:
+        return None, "the stop temperature must be below the first point"
+    for (temp_a, pwm_a), (temp_b, pwm_b) in zip(clean, clean[1:]):
+        if temp_b <= temp_a:
+            return None, "temperatures must increase from point to point"
+        if pwm_b < pwm_a:
+            return None, "fan speed must not drop as temperature rises"
+    if clean[-1][1] != FAN_PWM_MAX:
+        return None, "the last point must be full speed"
+    return {"points": clean, "stop": stop}, None
+
+
+def _target_curve(target):
+    temps = [target + offset for offset in FAN_TARGET_CURVE_OFFSETS]
+    temps[-1] = min(temps[-1], FAN_CURVE_TEMP_MAX)
+    for index in range(len(temps) - 2, -1, -1):
+        temps[index] = min(temps[index], temps[index + 1] - 1)
+    pwms = [round(percent * FAN_PWM_MAX / 100) for percent in FAN_TARGET_CURVE_PERCENT]
+    return {
+        "points": [[temp, pwm] for temp, pwm in zip(temps, pwms)],
+        "stop": temps[0] - FAN_TARGET_CURVE_STOP_GAP,
+    }
+
+
+def _curve_target(curve):
+    for target in range(FAN_SAFE_MIN, FAN_SAFE_MAX + 1):
+        if _target_curve(target) == curve:
+            return target
+    return None
+
+
+def _find_fan_hwmon():
+    try:
+        entries = sorted(os.listdir(HWMON_DIR))
+    except OSError:
+        return None
+    for entry in entries:
+        base = os.path.join(HWMON_DIR, entry)
+        try:
+            if _read_sysfs(os.path.join(base, "name")) == FAN_HWMON_NAME:
+                return base
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def _fan_hwmon_dir():
+    base = _find_fan_hwmon()
+    if base is None:
+        raise FileNotFoundError(errno.ENOENT, "No such device", FAN_HWMON_DESC)
+    return base
+
+
+def _read_hwmon_int(base, name):
+    raw = _read_sysfs(os.path.join(base, name))
+    value = _coerce_int(raw)
+    if value is None:
+        raise OSError(errno.EPROTO, f"Unexpected value {raw!r} in {name}")
+    return value
+
+
+def _read_fan_hwmon_sync():
+    base = _fan_hwmon_dir()
+    points = [
+        [
+            round(_read_hwmon_int(base, f"pwm1_auto_point{i}_temp") / 1000),
+            _read_hwmon_int(base, f"pwm1_auto_point{i}_pwm"),
+        ]
+        for i in range(1, FAN_CURVE_POINTS + 1)
+    ]
+    stop = round(_read_hwmon_int(base, "pwm1_auto_point1_temp_hyst") / 1000)
+    status = {"curve": {"points": points, "stop": stop}, "mode": None, "pwm": None, "temp": None}
+    status["mode"] = _read_hwmon_int(base, "pwm1_enable")
+    try:
+        status["pwm"] = _read_hwmon_int(base, "pwm1")
+    except OSError:
+        pass
+    try:
+        status["temp"] = round(_read_hwmon_int(base, "temp1_input") / 1000, 1)
+    except OSError:
+        pass
+    return status
+
+
+def _curve_writes(curve):
+    yield "pwm1_auto_point1_temp_hyst", curve["stop"] * 1000
+    for index, (temp, pwm) in enumerate(curve["points"], 1):
+        yield f"pwm1_auto_point{index}_temp", temp * 1000
+        yield f"pwm1_auto_point{index}_pwm", pwm
+
+
+def _write_fan_curve_sync(curve):
+    base = _fan_hwmon_dir()
+    pending = list(_curve_writes(curve))
+    while pending:
+        rejected = []
+        last_error = None
+        for name, value in pending:
+            try:
+                _write_sysfs(os.path.join(base, name), value)
+            except OSError as exc:
+                if exc.errno != errno.EINVAL:
+                    raise
+                rejected.append((name, value))
+                last_error = exc
+        if len(rejected) == len(pending):
+            raise last_error
+        pending = rejected
+    return _read_fan_hwmon_sync()
+
+
+def _reset_fan_curve_sync():
+    _write_sysfs(os.path.join(_fan_hwmon_dir(), "curve_reset"), 1)
+    return _read_fan_hwmon_sync()
+
+
+def _read_fan_mode_sync():
+    return _read_hwmon_int(_fan_hwmon_dir(), "pwm1_enable")
+
+
+def _write_fan_mode_sync(mode):
+    _write_sysfs(os.path.join(_fan_hwmon_dir(), "pwm1_enable"), mode)
+
+
+async def _fan_interface():
+    try:
+        base = await asyncio.wait_for(_run_detached(_find_fan_hwmon), timeout=IO_TIMEOUT_SECONDS)
+    except Exception:
+        base = None
+    if base is not None:
+        return "curve"
+    if os.path.exists(FAN_TARGET_PATH):
+        return "target"
+    return None
+
+
 def _cpu_temperature(sensors):
     readings = [s["celsius"] for s in sensors if s["chip"] == CPU_SENSOR_CHIP]
     return max(readings) if readings else None
@@ -300,6 +478,7 @@ def _sanitize_settings(raw):
     saved = _coerce_int(raw.get("saved_target"))
     if saved is not None and FAN_SAFE_MIN <= saved <= FAN_SAFE_MAX:
         settings["saved_target"] = saved
+    settings["saved_curve"], _ = _sanitize_curve(raw.get("saved_curve"))
     settings["led_loop_enabled"] = raw.get("led_loop_enabled") is True
     loop_seconds = _coerce_int(raw.get("led_loop_seconds"))
     if loop_seconds is not None and LED_LOOP_MIN <= loop_seconds <= LED_LOOP_MAX:
@@ -356,7 +535,16 @@ async def _save_settings(settings):
         return False, f"Saving settings failed: unexpected error: {exc}"
 
 
+async def _ensure_settings():
+    global _settings_loaded
+    async with _settings_lock:
+        if not _settings_loaded:
+            _settings.update(await _run_detached(_load_settings_sync))
+            _settings_loaded = True
+
+
 async def _remember_setting(key, value):
+    await _ensure_settings()
     async with _settings_lock:
         if _settings[key] == value:
             return
@@ -371,7 +559,9 @@ def _guard_snapshot():
         "enabled": _settings["guard_enabled"],
         "active": _guard["active"],
         "threshold": _settings["guard_threshold"],
+        "kind": _guard["kind"],
         "restore_target": _guard["restore_target"],
+        "restore_mode": _guard["restore_mode"],
         "cpu": _guard["cpu"],
         "alarm_enabled": _settings["alarm_enabled"],
         "alarm_active": _alarm["active"],
@@ -393,7 +583,36 @@ async def _write_fan_target_locked(action, target):
     return True, confirmed
 
 
+async def _set_fan_mode_locked(action, mode):
+    if _guard["active"] and _guard["kind"] == "curve":
+        _guard["restore_mode"] = mode
+        return True, True
+    ok, error = await _guarded_io(action, FAN_HWMON_DESC, _write_fan_mode_sync, mode)
+    return ok, (False if ok else error)
+
+
+async def _guard_engage_curve(cpu):
+    async with _fan_lock:
+        if _guard["active"]:
+            return
+        ok, current = await _guarded_io("Reading fan mode", FAN_HWMON_DESC, _read_fan_mode_sync)
+        previous = current if ok else None
+        ok, error = await _guarded_io(
+            "Engaging thermal guard", FAN_HWMON_DESC, _write_fan_mode_sync, FAN_MODE_FULL
+        )
+        if not ok:
+            logger.error(error)
+            return
+        _guard["active"] = True
+        _guard["kind"] = "curve"
+        _guard["restore_mode"] = previous if previous is not None else FAN_MODE_CURVE
+    logger.warning(f"Thermal guard engaged at CPU {cpu:.1f} °C: fan at full speed")
+
+
 async def _guard_engage(cpu):
+    if await _fan_interface() == "curve":
+        await _guard_engage_curve(cpu)
+        return
     async with _fan_lock:
         if _guard["active"]:
             return
@@ -408,6 +627,7 @@ async def _guard_engage(cpu):
             logger.error(result)
             return
         _guard["active"] = True
+        _guard["kind"] = "target"
         _guard["restore_target"] = (
             previous if previous is not None else _settings["saved_target"] or FAN_BOOT_TARGET
         )
@@ -420,12 +640,28 @@ async def _guard_release(reason):
     async with _fan_lock:
         if not _guard["active"]:
             return
+        if _guard["kind"] == "curve":
+            mode = _guard["restore_mode"]
+            if mode is None:
+                mode = FAN_MODE_CURVE
+            ok, error = await _guarded_io(
+                "Releasing thermal guard", FAN_HWMON_DESC, _write_fan_mode_sync, mode
+            )
+            if not ok:
+                logger.error(error)
+                return
+            _guard["active"] = False
+            _guard["kind"] = None
+            _guard["restore_mode"] = None
+            logger.info(f"Thermal guard released ({reason}): fan mode {mode}")
+            return
         target = _guard["restore_target"] or _settings["saved_target"] or FAN_BOOT_TARGET
         ok, result = await _write_fan_target_locked("Releasing thermal guard", target)
         if not ok:
             logger.error(result)
             return
         _guard["active"] = False
+        _guard["kind"] = None
         _guard["restore_target"] = None
     logger.info(f"Thermal guard released ({reason}): fan target {target} °C")
 
@@ -764,7 +1000,6 @@ def _scan_cpufreq():
 
 
 def _write_cpu_clock_sync(mhz):
-    # scaling_min_freq may never exceed scaling_max_freq, so widen, then narrow.
     failures = []
     for base in _cpu_policy_dirs():
         hw_min = _read_sysfs(os.path.join(base, "cpuinfo_min_freq"))
@@ -893,7 +1128,6 @@ def _write_gpu_governor_sync(governor):
 
 
 def _write_gpu_clock_sync(mhz):
-    # devfreq treats 0 as "no limit" for both bounds.
     min_path = os.path.join(GPU_DEVFREQ_PATH, "min_freq")
     max_path = os.path.join(GPU_DEVFREQ_PATH, "max_freq")
     if mhz is None:
@@ -916,7 +1150,6 @@ def _kernel_config_paths():
 
 
 def _read_kernel_option_sync(option):
-    """Returns 'y', 'm', 'n', or None when no kernel config is readable."""
     prefix = f"{option}="
     unset = f"# {option} is not set"
     for path in _kernel_config_paths():
@@ -1038,6 +1271,146 @@ async def _unload_hardware():
         await _alarm_clear("plugin unloading")
 
 
+async def _restore_fan():
+    target = _settings["saved_target"]
+    curve = _settings["saved_curve"]
+    if not _settings["restore_on_boot"] or (target is None and curve is None):
+        return True, None
+    interface = await _fan_interface()
+    if interface == "curve":
+        if curve is None:
+            curve = _target_curve(target)
+        async with _fan_lock:
+            ok, result = await _guarded_io(
+                "Restoring fan curve", FAN_HWMON_DESC, _write_fan_curve_sync, curve
+            )
+        if not ok:
+            return False, result
+        restored = _curve_target(curve)
+        return True, f"Restored fan target {restored} °C" if restored else "Restored fan curve"
+    if interface == "target":
+        if target is None:
+            return True, "Saved fan curve skipped: this kernel only takes a target temperature"
+        async with _fan_lock:
+            if _guard["active"]:
+                _guard["restore_target"] = target
+                return True, f"Fan target {target} °C will apply once Thermal Guard releases the fan"
+            ok, result = await _write_fan_target_locked("Restoring fan target", target)
+        return (True, f"Restored fan target to {result} °C") if ok else (False, result)
+    return False, f"Fan interface missing ({FAN_HWMON_DESC} or {FAN_TARGET_PATH})"
+
+
+async def _restore_cpu_governor():
+    governor = _settings["saved_governor"]
+    if not _settings["cpu_restore_on_boot"] or not governor:
+        return True, None
+    if not os.path.isdir(CPUFREQ_DIR):
+        return False, f"CPU frequency interface missing at {CPUFREQ_DIR}"
+    async with _cpu_lock:
+        ok, result = await _apply_governor_locked("Restoring CPU governor", governor)
+    return (True, f"Restored CPU governor to {governor}") if ok else (False, result)
+
+
+async def _restore_cpu_clock():
+    clock = _settings["saved_cpu_clock"]
+    if not _settings["cpu_restore_on_boot"] or not clock:
+        return True, None
+    if not os.path.isdir(CPUFREQ_DIR):
+        return False, f"CPU frequency interface missing at {CPUFREQ_DIR}"
+    async with _cpu_lock:
+        ok, result = await _apply_cpu_clock_locked("Restoring CPU clock", clock)
+    if not ok:
+        return False, result
+    return True, f"Restored CPU clock lock at {result['locked_mhz']} MHz"
+
+
+async def _restore_gpu_governor():
+    governor = _settings["saved_gpu_governor"]
+    if not _settings["gpu_restore_on_boot"] or not governor:
+        return True, None
+    if not os.path.isdir(GPU_DEVFREQ_PATH):
+        return False, await _describe_missing_gpufreq()
+    async with _gpu_lock:
+        ok, result = await _apply_gpu_governor_locked("Restoring GPU governor", governor)
+    return (True, f"Restored GPU governor to {governor}") if ok else (False, result)
+
+
+async def _restore_gpu_clock():
+    clock = _settings["saved_gpu_clock"]
+    if not _settings["gpu_restore_on_boot"] or not clock:
+        return True, None
+    if not os.path.isdir(GPU_DEVFREQ_PATH):
+        return False, await _describe_missing_gpufreq()
+    async with _gpu_lock:
+        ok, result = await _apply_gpu_clock_locked("Restoring GPU clock", clock)
+    if not ok:
+        return False, result
+    return True, f"Restored GPU clock lock at {result['locked_mhz']} MHz"
+
+
+async def _restore_led():
+    preset = _settings["saved_led_preset"]
+    if not _settings["led_restore_on_boot"] or not preset:
+        return True, None
+    if not os.path.isdir(LED_CLASS_DIR):
+        return False, f"LED class interface missing at {LED_CLASS_DIR}"
+    async with _led_lock:
+        ok, error = await _apply_led_preset_locked("Restoring LED preset", preset)
+    return (True, f"Restored LED preset '{preset}'") if ok else (False, error)
+
+
+_RESTORES = (
+    ("fan", _restore_fan),
+    ("CPU governor", _restore_cpu_governor),
+    ("CPU clock", _restore_cpu_clock),
+    ("GPU governor", _restore_gpu_governor),
+    ("GPU clock", _restore_gpu_clock),
+    ("LED preset", _restore_led),
+)
+
+
+async def _restore_round(pending):
+    failed = []
+    for label, restore in pending:
+        try:
+            ok, message = await restore()
+        except Exception as exc:
+            ok, message = False, f"unexpected error: {exc}"
+        if ok:
+            if message:
+                logger.info(message)
+        else:
+            failed.append((label, restore, message))
+    return failed
+
+
+async def _restore_retry_loop(failed):
+    deadline = time.monotonic() + RESTORE_TIMEOUT_SECONDS
+    logged = None
+    while failed:
+        waiting = ", ".join(label for label, _restore, _message in failed)
+        if waiting != logged:
+            logger.info(f"Waiting to restore: {waiting}")
+            logged = waiting
+        if time.monotonic() >= deadline:
+            for label, _restore, message in failed:
+                logger.error(f"Gave up restoring the {label} after {RESTORE_TIMEOUT_SECONDS:.0f} s: {message}")
+            return
+        await asyncio.sleep(RESTORE_RETRY_SECONDS)
+        failed = await _restore_round([(label, restore) for label, restore, _message in failed])
+
+
+def _interfaces():
+    return (
+        ("Fan", _find_fan_hwmon() or FAN_TARGET_PATH),
+        ("Temperature sensors", HWMON_DIR),
+        ("LED class", LED_CLASS_DIR),
+        ("CPU frequency", CPUFREQ_DIR),
+        ("GPU frequency", GPU_DEVFREQ_PATH),
+        ("Buzzer", BUZZER_DIR),
+    )
+
+
 class Plugin:
     async def get_fan_target(self):
         async with _fan_lock:
@@ -1061,6 +1434,9 @@ class Plugin:
                 f"{FAN_SAFE_MIN}-{FAN_SAFE_MAX} °C"
             )
 
+        if await _fan_interface() == "curve":
+            return await self._set_fan_target_curve(target)
+
         async with _fan_lock:
             if _guard["active"]:
                 _guard["restore_target"] = target
@@ -1079,6 +1455,27 @@ class Plugin:
             )
         return _ok(f"Fan target set to {result} °C", {"temp": result})
 
+    async def _set_fan_target_curve(self, target):
+        curve = _target_curve(target)
+        async with _fan_lock:
+            ok, status = await _guarded_io(
+                "Setting fan target", FAN_HWMON_DESC, _write_fan_curve_sync, curve
+            )
+            if not ok:
+                return _fail(status)
+            if status["curve"] != curve:
+                return _fail("Setting fan target: write accepted but the driver reports another curve")
+            ok, deferred = await _set_fan_mode_locked("Switching fan to curve mode", FAN_MODE_CURVE)
+            if not ok:
+                return _fail(deferred)
+
+        await _remember_setting("saved_target", target)
+        await _remember_setting("saved_curve", curve)
+        data = {"temp": target, "curve": status["curve"]}
+        if deferred:
+            return _ok(f"Thermal guard is cooling. {target} °C will apply once the CPU cools down", data)
+        return _ok(f"Fan target set to {target} °C", {**data, "mode": FAN_MODE_CURVE})
+
     async def get_temperatures(self):
         sensors = await _read_temperatures()
         if not sensors:
@@ -1086,30 +1483,98 @@ class Plugin:
         return _ok(f"Read {len(sensors)} temperature sensors", {"sensors": sensors}, log=False)
 
     async def get_fan_status(self):
-        async with _fan_lock:
-            ok, value = await _guarded_io(
-                "Reading fan target", FAN_TARGET_PATH, _read_sysfs, FAN_TARGET_PATH
-            )
-        target = _coerce_int(value) if ok else None
-        target_error = None
-        if not ok:
-            target_error = value
-        elif target is None:
-            target_error = f"Unexpected fan target value: {value!r}"
+        interface = await _fan_interface()
+        target = target_error = fan = fan_error = None
+        if interface == "curve":
+            async with _fan_lock:
+                ok, value = await _guarded_io(
+                    "Reading fan curve", FAN_HWMON_DESC, _read_fan_hwmon_sync
+                )
+            if ok:
+                fan = value
+                target = _curve_target(fan["curve"])
+            else:
+                fan_error = value
+        else:
+            async with _fan_lock:
+                ok, value = await _guarded_io(
+                    "Reading fan target", FAN_TARGET_PATH, _read_sysfs, FAN_TARGET_PATH
+                )
+            target = _coerce_int(value) if ok else None
+            if not ok:
+                target_error = value
+            elif target is None:
+                target_error = f"Unexpected fan target value: {value!r}"
 
         sensors = await _read_temperatures()
         return _ok(
             "Fan status updated",
             {
+                "interface": interface,
                 "target": target,
                 "target_error": target_error,
+                "fan": fan,
+                "fan_error": fan_error,
                 "sensors": sensors,
                 "guard": _guard_snapshot(),
             },
             log=False,
         )
 
+    async def set_fan_curve(self, curve):
+        clean, problem = _sanitize_curve(curve)
+        if clean is None:
+            return _fail(f"Invalid fan curve: {problem}")
+
+        async with _fan_lock:
+            ok, status = await _guarded_io(
+                "Setting fan curve", FAN_HWMON_DESC, _write_fan_curve_sync, clean
+            )
+            if not ok:
+                return _fail(status)
+            if status["curve"] != clean:
+                return _fail("Setting fan curve: write accepted but the driver reports another curve")
+            ok, deferred = await _set_fan_mode_locked("Switching fan to curve mode", FAN_MODE_CURVE)
+            if not ok:
+                return _fail(deferred)
+
+        await _remember_setting("saved_curve", clean)
+        if deferred:
+            return _ok("Fan curve saved. It takes over once Thermal Guard releases the fan", status)
+        return _ok("Fan curve applied", {**status, "mode": FAN_MODE_CURVE})
+
+    async def reset_fan_curve(self):
+        async with _fan_lock:
+            ok, status = await _guarded_io(
+                "Resetting fan curve", FAN_HWMON_DESC, _reset_fan_curve_sync
+            )
+            if not ok:
+                return _fail(status)
+            ok, deferred = await _set_fan_mode_locked("Switching fan to curve mode", FAN_MODE_CURVE)
+            if not ok:
+                return _fail(deferred)
+
+        await _remember_setting("saved_curve", None)
+        await _remember_setting("saved_target", None)
+        if deferred:
+            return _ok("Default curve restored. It takes over once Thermal Guard releases the fan", status)
+        return _ok("Default fan curve restored", {**status, "mode": FAN_MODE_CURVE})
+
+    async def set_fan_mode(self, mode):
+        value = _coerce_int(mode)
+        if value not in (FAN_MODE_FULL, FAN_MODE_CURVE):
+            return _fail(f"Invalid fan mode: {mode!r}")
+        async with _fan_lock:
+            ok, deferred = await _set_fan_mode_locked("Setting fan mode", value)
+        if not ok:
+            return _fail(deferred)
+        label = "full speed" if value == FAN_MODE_FULL else "curve"
+        if deferred:
+            return _ok(f"Thermal guard is cooling. The fan switches to {label} once the CPU cools down")
+        return _ok(f"Fan set to {label}", {"mode": value})
+
     async def get_fan_settings(self):
+        await _ensure_settings()
         return _ok(
             "Fan settings loaded",
             {"settings": dict(_settings), "guard": _guard_snapshot()},
@@ -1142,6 +1607,7 @@ class Plugin:
         if not updates:
             return _fail("No settings provided")
 
+        await _ensure_settings()
         async with _settings_lock:
             candidate = dict(_settings)
             candidate.update(updates)
@@ -1173,6 +1639,7 @@ class Plugin:
         )
 
     async def get_led_settings(self):
+        await _ensure_settings()
         return _ok("LED settings loaded", _led_settings_snapshot(), log=False)
 
     async def set_led_settings(self, loop_enabled=None, loop_seconds=None, restore_on_boot=None):
@@ -1195,6 +1662,7 @@ class Plugin:
         if not updates:
             return _fail("No settings provided")
 
+        await _ensure_settings()
         async with _settings_lock:
             candidate = dict(_settings)
             candidate.update(updates)
@@ -1253,12 +1721,14 @@ class Plugin:
         return _ok(f"CPU clock locked at {result['locked_mhz']} MHz", result)
 
     async def get_cpu_settings(self):
+        await _ensure_settings()
         return _ok("CPU settings loaded", _cpu_settings_snapshot(), log=False)
 
     async def set_cpu_settings(self, restore_on_boot=None):
         if not isinstance(restore_on_boot, bool):
             return _fail(f"Invalid restore_on_boot value: {restore_on_boot!r}")
 
+        await _ensure_settings()
         async with _settings_lock:
             candidate = dict(_settings)
             candidate["cpu_restore_on_boot"] = restore_on_boot
@@ -1305,12 +1775,14 @@ class Plugin:
         return _ok(f"GPU clock locked at {result['locked_mhz']} MHz", result)
 
     async def get_gpu_settings(self):
+        await _ensure_settings()
         return _ok("GPU settings loaded", _gpu_settings_snapshot(), log=False)
 
     async def set_gpu_settings(self, restore_on_boot=None):
         if not isinstance(restore_on_boot, bool):
             return _fail(f"Invalid restore_on_boot value: {restore_on_boot!r}")
 
+        await _ensure_settings()
         async with _settings_lock:
             candidate = dict(_settings)
             candidate["gpu_restore_on_boot"] = restore_on_boot
@@ -1322,16 +1794,9 @@ class Plugin:
         return _ok("GPU settings saved", _gpu_settings_snapshot())
 
     async def _main(self):
-        global _guard_task, _led_loop_task
+        global _guard_task, _led_loop_task, _restore_task
         logger.info("PS5 Hardware Control loaded")
-        for label, path in (
-            ("Fan", FAN_TARGET_PATH),
-            ("Temperature sensors", HWMON_DIR),
-            ("LED class", LED_CLASS_DIR),
-            ("CPU frequency", CPUFREQ_DIR),
-            ("GPU frequency", GPU_DEVFREQ_PATH),
-            ("Buzzer", BUZZER_DIR),
-        ):
+        for label, path in _interfaces():
             if os.path.exists(path):
                 logger.info(f"{label} interface found at {path}")
             else:
@@ -1339,71 +1804,17 @@ class Plugin:
         if not os.path.isdir(GPU_DEVFREQ_PATH):
             logger.warning(await _describe_missing_gpufreq())
 
-        loaded = await _run_detached(_load_settings_sync)
-        async with _settings_lock:
-            _settings.update(loaded)
-
-        saved = _settings["saved_target"]
-        if _settings["restore_on_boot"] and saved is not None and os.path.exists(FAN_TARGET_PATH):
-            async with _fan_lock:
-                ok, result = await _write_fan_target_locked("Restoring fan target", saved)
-            if ok:
-                logger.info(f"Restored fan target to {result} °C")
-            else:
-                logger.error(result)
-
-        governor = _settings["saved_governor"]
-        if _settings["cpu_restore_on_boot"] and governor and os.path.isdir(CPUFREQ_DIR):
-            async with _cpu_lock:
-                ok, result = await _apply_governor_locked("Restoring CPU governor", governor)
-            if ok:
-                logger.info(f"Restored CPU governor to {governor}")
-            else:
-                logger.error(result)
-
-        cpu_clock = _settings["saved_cpu_clock"]
-        if _settings["cpu_restore_on_boot"] and cpu_clock and os.path.isdir(CPUFREQ_DIR):
-            async with _cpu_lock:
-                ok, result = await _apply_cpu_clock_locked("Restoring CPU clock", cpu_clock)
-            if ok:
-                logger.info(f"Restored CPU clock lock at {result['locked_mhz']} MHz")
-            else:
-                logger.error(result)
-
-        gpu_governor = _settings["saved_gpu_governor"]
-        if _settings["gpu_restore_on_boot"] and gpu_governor and os.path.isdir(GPU_DEVFREQ_PATH):
-            async with _gpu_lock:
-                ok, result = await _apply_gpu_governor_locked(
-                    "Restoring GPU governor", gpu_governor
-                )
-            if ok:
-                logger.info(f"Restored GPU governor to {gpu_governor}")
-            else:
-                logger.error(result)
-
-        gpu_clock = _settings["saved_gpu_clock"]
-        if _settings["gpu_restore_on_boot"] and gpu_clock and os.path.isdir(GPU_DEVFREQ_PATH):
-            async with _gpu_lock:
-                ok, result = await _apply_gpu_clock_locked("Restoring GPU clock", gpu_clock)
-            if ok:
-                logger.info(f"Restored GPU clock lock at {result['locked_mhz']} MHz")
-            else:
-                logger.error(result)
-
-        led_preset = _settings["saved_led_preset"]
-        if _settings["led_restore_on_boot"] and led_preset and os.path.isdir(LED_CLASS_DIR):
-            async with _led_lock:
-                ok, error = await _apply_led_preset_locked("Restoring LED preset", led_preset)
-            if ok:
-                logger.info(f"Restored LED preset '{led_preset}'")
-            else:
-                logger.error(error)
-
+        await _ensure_settings()
+        failed = await _restore_round(_RESTORES)
+        if failed:
+            _restore_task = asyncio.create_task(_restore_retry_loop(failed))
         _guard_task = asyncio.create_task(_guard_loop())
         _led_loop_task = asyncio.create_task(_led_loop())
 
     async def _unload(self):
-        global _guard_task, _led_loop_task
+        global _guard_task, _led_loop_task, _restore_task
+        await _cancel_task(_restore_task)
+        _restore_task = None
         await _cancel_task(_led_loop_task)
         _led_loop_task = None
         await _cancel_task(_guard_task)

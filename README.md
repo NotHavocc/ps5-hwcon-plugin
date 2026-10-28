@@ -1,17 +1,17 @@
 <h1 align="center">ps5-hwcon-plugin</h1>
 
 <p align="center">
-  <img src="docs/screenshot-fan.png" alt="Fan tab" width="22%">
+  <img src="docs/screenshot-fan-curve.png" alt="Fan tab, curve editor" width="18%">
   &nbsp;
-  <img src="docs/screenshot-cpu.png" alt="CPU tab" width="22%">
+  <img src="docs/screenshot-cpu.png" alt="CPU tab" width="18%">
   &nbsp;
-  <img src="docs/screenshot-gpu.png" alt="GPU tab" width="22%">
+  <img src="docs/screenshot-gpu.png" alt="GPU tab" width="18%">
   &nbsp;
-  <img src="docs/screenshot-led.png" alt="LED tab" width="22%">
+  <img src="docs/screenshot-led.png" alt="LED tab" width="18%">
 </p>
 
 <p align="center">
-  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan target temperature, live temperatures, CPU and GPU governors and clocks, and indicator LED presets, all from the Quick Access Menu.
+  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan curve or target temperature, live temperatures, CPU and GPU governors and clocks, and indicator LED presets, all from the Quick Access Menu.
 </p>
 
 ---
@@ -74,14 +74,20 @@ This link always points to the newest release, so entering it again updates the 
 
 ### Fan
 
-- **Temperatures**: live CPU (`k10temp`) readings, plus any other hwmon sensors, refreshed every 2 s.
-- **Presets**: Quiet 85 °C, Default 80 °C, Balanced 72 °C, Cool 65 °C and Max Cooling 50 °C. A lower target spins the fan up earlier and louder.
+**Fan Control** switches between **Target** (the original control) and **Curve**. Fan curves need a kernel with the `ps5_fan` hwmon driver (rmuxnet/ps5-linux-patches-1 `meower` from [`883eef9`](https://github.com/rmuxnet/ps5-linux-patches-1/commit/883eef9)); without it the tab opens on Target and Curve is greyed out. Those kernels drop `target_temp`, so there a target is applied as a curve that reaches 45% at the target and full speed 6 °C above it.
+
+- **Temperatures**: live CPU (`k10temp`) readings, plus any other hwmon sensors, refreshed every 2 s. On curve kernels the fan's current speed and mode are shown too.
+- **Fan curve** (hwmon kernels): the graph shows the 8 curve points (SoC temperature → fan speed), the stop temperature (diamond) and the live SoC temperature and fan speed. Pick a point with **Edit Point**, set its **Temperature** and **Fan Speed** with the sliders, then **Apply Curve**. The sliders keep the curve valid for the driver: temperatures rise from point to point, speed never drops, and the last point is 100%. Above 90 °C the kernel runs the fan at full speed no matter what.
+- **Curve presets**: Quiet (the kernel default), Balanced, Cool, and Full Speed.
+- **Target presets**: Quiet 85 °C, Default 80 °C, Balanced 72 °C, Cool 65 °C and Max Cooling 50 °C. A lower target spins the fan up earlier and louder.
 - **Manual Target**: any target from 40 to 90 °C.
-- **Restore on Startup**: re-applies your last target when Decky starts. The kernel resets it to 80 °C on every boot.
-- **Thermal Guard**: when the CPU reaches the Overheat Threshold (80–100 °C, default 95), the fan switches to Max Cooling. Your target comes back once the CPU is 10 °C cooler.
+- **Restore on Startup**: re-applies your last curve or target when Decky starts. The kernel resets both on every boot.
+- **Thermal Guard**: when the CPU reaches the Overheat Threshold (80–100 °C, default 95), the fan switches to Full Speed (or the Max Cooling target). Your setting comes back once the CPU is 10 °C cooler.
 - **Overheat Alarm**: plays the console's error beep once when the CPU reaches the threshold, and re-arms after it cools down.
 
 Thermal Guard and Overheat Alarm run in the background, even with the menu closed.
+
+Restore on Startup applies each setting as soon as its driver is ready. If a driver is still loading when Decky starts, the plugin keeps retrying for up to 60 s and logs which settings it is waiting for, or gave up on.
 
 ### CPU
 

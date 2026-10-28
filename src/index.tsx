@@ -14,6 +14,7 @@ import {
 } from "@decky/ui";
 import { FC, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  FaCheck,
   FaCube,
   FaExclamationTriangle,
   FaLightbulb,
@@ -24,6 +25,7 @@ import {
   FaSyncAlt,
   FaTachometerAlt,
   FaThermometerHalf,
+  FaUndo,
   FaUnlock,
   FaWind,
 } from "react-icons/fa";
@@ -34,11 +36,16 @@ import {
   CpuSettings,
   CpuStatusData,
   CuratedPreset,
+  FanCurve,
+  FanCurvePreset,
+  FanHwmonStatus,
   FanPreset,
   FanSettings,
   FanSettingsUpdate,
   FanStatusData,
   FanStatusResult,
+  FanUpdateResult,
+  FanView,
   GovernorInfo,
   GpuSettings,
   GpuStatusData,
@@ -64,6 +71,17 @@ const GPU_CLOCK_STEP = 25;
 const STATUS_POLL_MS = 2000;
 const THRESHOLD_SAVE_DELAY_MS = 600;
 const ACCENT = "#1a9fff";
+const LIVE_COLOR = "#f0b44c";
+const FAN_CURVE_TEMP_MIN = 20;
+const FAN_CURVE_TEMP_MAX = 90;
+const FAN_PWM_MAX = 255;
+const FAN_MODE_FULL = 0;
+const FAN_MODE_CURVE = 2;
+const FAN_MODE_LABELS: Record<number, string> = { [FAN_MODE_FULL]: "Full Speed", 1: "Manual", [FAN_MODE_CURVE]: "Curve" };
+const FAN_QUIET_TEMPS = [50, 60, 65, 70, 75, 80, 85, 87];
+const FAN_QUIET_STOP = 45;
+const FULL_SPEED_ID = "full";
+const STOP_HANDLE = 0;
 
 const STYLES = `
 .ps5hw-grid {
@@ -119,6 +137,12 @@ const STYLES = `
   font-size: 11px;
   opacity: 0.7;
 }
+.ps5hw-note {
+  font-size: 12px;
+  line-height: 1.35;
+  opacity: 0.7;
+  padding: 4px 0;
+}
 @container (max-width: 300px) {
   .ps5hw-tabs > .ps5hw-btn .ps5hw-label {
     flex-direction: column;
@@ -145,6 +169,42 @@ const FAN_PRESETS: FanPreset[] = [
   { id: "max", label: "Max Cooling", temp: FAN_MAX_COOLING },
 ];
 
+const pwmToPercent = (pwm: number) => Math.round((pwm * 100) / FAN_PWM_MAX);
+const percentToPwm = (percent: number) => Math.round((percent * FAN_PWM_MAX) / 100);
+
+const makeCurve = (stop: number, points: [number, number][]): FanCurve => ({
+  stop,
+  points: points.map(([temp, percent]) => [temp, percentToPwm(percent)]),
+});
+
+const FAN_CURVE_PRESETS: FanCurvePreset[] = [
+  { id: "quiet", label: "Quiet", subtitle: "Kernel default", curve: null },
+  {
+    id: "balanced",
+    label: "Balanced",
+    subtitle: "100% at 85 °C",
+    curve: makeCurve(40, [[45, 15], [55, 25], [60, 35], [65, 45], [70, 60], [75, 75], [80, 90], [85, 100]]),
+  },
+  {
+    id: "cool",
+    label: "Cool",
+    subtitle: "100% at 80 °C",
+    curve: makeCurve(35, [[40, 20], [50, 30], [55, 40], [60, 50], [65, 65], [70, 80], [75, 90], [80, 100]]),
+  },
+];
+
+const FULL_SPEED_PRESET: FanCurvePreset = {
+  id: FULL_SPEED_ID,
+  label: "Full Speed",
+  subtitle: "Ignores the curve",
+  curve: null,
+};
+
+const FAN_VIEWS: { id: FanView; label: string; description: string }[] = [
+  { id: "target", label: "Target", description: "Hold a temperature" },
+  { id: "curve", label: "Curve", description: "Speed per temperature" },
+];
+
 const CURATED_PRESETS: CuratedPreset[] = [
   { id: "off", label: "Off" },
   { id: "white_bright", label: "White Bright" },
@@ -163,13 +223,11 @@ const GOVERNORS: Record<string, GovernorInfo> = {
   userspace: { label: "Userspace", description: "Speed set by a program" },
 };
 
-// With EPP drivers the hardware picks clocks itself; the governor only sets a bias.
 const EPP_GOVERNORS: Record<string, GovernorInfo> = {
   performance: { label: "Performance", description: "Biased to max clocks" },
   powersave: { label: "Powersave", description: "Firmware managed" },
 };
 
-// devfreq governors, as exposed by the ps5-gpufreq driver.
 const GPU_GOVERNORS: Record<string, GovernorInfo> = {
   simple_ondemand: { label: "Ondemand", description: "Follows GPU load" },
   performance: { label: "Performance", description: "Highest clock" },
@@ -185,6 +243,8 @@ const TABS: { id: TabId; label: string; icon: JSX.Element }[] = [
 ];
 
 let lastTab: TabId = "fan";
+let lastFanView: FanView | null = null;
+let lastCurveHandle = 1;
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
@@ -207,6 +267,59 @@ const prettifyPreset = (id: string) =>
 
 const formatFreq = (mhz: number) =>
   mhz >= 1000 ? `${(mhz / 1000).toFixed(2)} GHz` : `${mhz} MHz`;
+
+const fanModeLabel = (mode: number | null) =>
+  mode === null ? "Unknown" : FAN_MODE_LABELS[mode] ?? `Mode ${mode}`;
+
+const curvesEqual = (a: FanCurve, b: FanCurve) =>
+  a.stop === b.stop &&
+  a.points.length === b.points.length &&
+  a.points.every(([temp, pwm], i) => temp === b.points[i][0] && pwm === b.points[i][1]);
+
+const curvePresetId = (curve: FanCurve) => {
+  for (const preset of FAN_CURVE_PRESETS) {
+    if (preset.curve === null) {
+      const temps = curve.points.map(([temp]) => temp);
+      if (curve.stop === FAN_QUIET_STOP && temps.join() === FAN_QUIET_TEMPS.join()) {
+        return preset.id;
+      }
+    } else if (curvesEqual(curve, preset.curve)) {
+      return preset.id;
+    }
+  }
+  return null;
+};
+
+const handleBounds = (curve: FanCurve, handle: number) => {
+  const { points, stop } = curve;
+  if (handle === STOP_HANDLE) {
+    return { tempLow: Math.min(FAN_CURVE_TEMP_MIN, stop), tempHigh: points[0][0] - 1, pwmLow: 0, pwmHigh: 0 };
+  }
+  const index = handle - 1;
+  const last = points.length - 1;
+  return {
+    tempLow: index > 0 ? points[index - 1][0] + 1 : stop + 1,
+    tempHigh: index < last ? points[index + 1][0] - 1 : FAN_CURVE_TEMP_MAX,
+    pwmLow: index > 0 ? points[index - 1][1] : 0,
+    pwmHigh: index < last ? points[index + 1][1] : FAN_PWM_MAX,
+  };
+};
+
+const moveHandle = (curve: FanCurve, handle: number, temp: number, percent: number): FanCurve | null => {
+  const bounds = handleBounds(curve, handle);
+  const nextTemp = clamp(temp, bounds.tempLow, bounds.tempHigh);
+  if (handle === STOP_HANDLE) {
+    return nextTemp === curve.stop ? null : { ...curve, stop: nextTemp };
+  }
+  const [oldTemp, oldPwm] = curve.points[handle - 1];
+  const nextPwm =
+    pwmToPercent(oldPwm) === percent ? oldPwm : clamp(percentToPwm(percent), bounds.pwmLow, bounds.pwmHigh);
+  if (nextTemp === oldTemp && nextPwm === oldPwm) {
+    return null;
+  }
+  const points = curve.points.map((point, i): [number, number] => (i === handle - 1 ? [nextTemp, nextPwm] : point));
+  return { ...curve, points };
+};
 
 const isEppDriver = (driver: string | null) =>
   driver !== null && (driver.endsWith("-epp") || driver === "intel_pstate");
@@ -286,7 +399,6 @@ const ClockLockSection: FC<{
     return null;
   }
 
-  // Uneven frequency tables still get a slider step that lands on every entry.
   const step =
     steps.length > 1 ? steps.slice(1).reduce((acc, mhz, i) => gcd(acc, mhz - steps[i]), 0) || fallbackStep : fallbackStep;
 
@@ -404,11 +516,238 @@ const TabBar: FC<{ active: TabId; onChange: (tab: TabId) => void }> = ({ active,
   </ButtonGrid>
 );
 
+const GRAPH_WIDTH = 300;
+const GRAPH_HEIGHT = 170;
+const GRAPH_LEFT = 32;
+const GRAPH_RIGHT = 8;
+const GRAPH_TOP = 8;
+const GRAPH_BOTTOM = 20;
+
+const CurveGraph: FC<{
+  curve: FanCurve;
+  selected: number;
+  liveTemp: number | null;
+  livePwm: number | null;
+  dimmed: boolean;
+}> = ({ curve, selected, liveTemp, livePwm, dimmed }) => {
+  const plotWidth = GRAPH_WIDTH - GRAPH_LEFT - GRAPH_RIGHT;
+  const plotHeight = GRAPH_HEIGHT - GRAPH_TOP - GRAPH_BOTTOM;
+  const bottom = GRAPH_TOP + plotHeight;
+  const right = GRAPH_LEFT + plotWidth;
+  const x = (temp: number) =>
+    GRAPH_LEFT +
+    ((clamp(temp, FAN_CURVE_TEMP_MIN, FAN_CURVE_TEMP_MAX) - FAN_CURVE_TEMP_MIN) /
+      (FAN_CURVE_TEMP_MAX - FAN_CURVE_TEMP_MIN)) *
+      plotWidth;
+  const y = (percent: number) => bottom - (percent / 100) * plotHeight;
+  const color = dimmed ? "#67707b" : ACCENT;
+
+  const points = curve.points.map(([temp, pwm]) => [x(temp), y(pwmToPercent(pwm))] as const);
+  const [firstX, firstY] = points[0];
+  const lastY = points[points.length - 1][1];
+  const line = [...points.map(([px, py]) => `${px},${py}`), `${right},${lastY}`].join(" ");
+  const stopX = x(curve.stop);
+
+  const tempTicks: number[] = [];
+  for (let temp = FAN_CURVE_TEMP_MIN; temp <= FAN_CURVE_TEMP_MAX; temp += 10) {
+    tempTicks.push(temp);
+  }
+
+  return (
+    <svg
+      viewBox={`0 0 ${GRAPH_WIDTH} ${GRAPH_HEIGHT}`}
+      style={{ width: "100%", height: "auto", display: "block" }}
+      fontSize={9}
+    >
+      <rect x={GRAPH_LEFT} y={GRAPH_TOP} width={plotWidth} height={plotHeight} fill="rgba(255,255,255,0.04)" />
+      {tempTicks.map((temp) => (
+        <g key={`t${temp}`}>
+          <line x1={x(temp)} x2={x(temp)} y1={GRAPH_TOP} y2={bottom} stroke="rgba(255,255,255,0.08)" />
+          <text x={x(temp)} y={GRAPH_HEIGHT - 6} fill="#8b929a" textAnchor="middle">
+            {temp}°
+          </text>
+        </g>
+      ))}
+      {[0, 25, 50, 75, 100].map((percent) => (
+        <g key={`p${percent}`}>
+          <line x1={GRAPH_LEFT} x2={right} y1={y(percent)} y2={y(percent)} stroke="rgba(255,255,255,0.08)" />
+          <text x={GRAPH_LEFT - 4} y={y(percent) + 3} fill="#8b929a" textAnchor="end">
+            {percent}%
+          </text>
+        </g>
+      ))}
+      {}
+      <rect x={stopX} y={GRAPH_TOP} width={Math.max(0, firstX - stopX)} height={plotHeight} fill={color} opacity={0.12} />
+      <path d={`M ${firstX},${bottom} L ${line} L ${right},${bottom} Z`} fill={color} opacity={0.18} />
+      <line x1={firstX} x2={firstX} y1={bottom} y2={firstY} stroke={color} strokeDasharray="3 3" />
+      <polyline points={line} fill="none" stroke={color} strokeWidth={2} />
+      {liveTemp !== null && (
+        <>
+          <line
+            x1={x(liveTemp)}
+            x2={x(liveTemp)}
+            y1={GRAPH_TOP}
+            y2={bottom}
+            stroke={LIVE_COLOR}
+            strokeDasharray="1 3"
+          />
+          {livePwm !== null && <circle cx={x(liveTemp)} cy={y(pwmToPercent(livePwm))} r={3.5} fill={LIVE_COLOR} />}
+        </>
+      )}
+      <polygon
+        points={`${stopX},${bottom - 6} ${stopX + 6},${bottom} ${stopX},${bottom + 6} ${stopX - 6},${bottom}`}
+        fill={selected === STOP_HANDLE ? color : "#23262e"}
+        stroke={selected === STOP_HANDLE ? "#ffffff" : color}
+        strokeWidth={2}
+      />
+      {points.map(([px, py], index) => {
+        const active = selected === index + 1;
+        return (
+          <circle
+            key={index}
+            cx={px}
+            cy={py}
+            r={active ? 6 : 4.5}
+            fill={active ? color : "#23262e"}
+            stroke={active ? "#ffffff" : color}
+            strokeWidth={2}
+          />
+        );
+      })}
+    </svg>
+  );
+};
+
+const FanCurveEditor: FC<{
+  curve: FanCurve;
+  fan: FanHwmonStatus;
+  busy: boolean;
+  applying: string | null;
+  onChange: (curve: FanCurve) => void;
+  onApply: () => void;
+  onRevert: () => void;
+}> = ({ curve, fan, busy, applying, onChange, onApply, onRevert }) => {
+  const [selected, setSelected] = useState<number>(lastCurveHandle);
+  const bounds = handleBounds(curve, selected);
+  const isStop = selected === STOP_HANDLE;
+  const [temp, pwm] = isStop ? [curve.stop, 0] : curve.points[selected - 1];
+  const percent = pwmToPercent(pwm);
+  const edited = !curvesEqual(curve, fan.curve);
+
+  const select = (handle: number) => {
+    lastCurveHandle = handle;
+    setSelected(handle);
+  };
+
+  const move = (nextTemp: number, nextPercent: number) => {
+    const next = moveHandle(curve, selected, nextTemp, nextPercent);
+    if (next !== null) {
+      onChange(next);
+    }
+  };
+
+  const pointDescription = isStop
+    ? `Fan stops below ${curve.stop} °C`
+    : `Point ${selected}: ${temp} °C → ${percent}%`;
+
+  let speedDescription = `Allowed ${pwmToPercent(bounds.pwmLow)}–${pwmToPercent(bounds.pwmHigh)}%`;
+  if (selected === curve.points.length) {
+    speedDescription = "The last point always runs the fan at full speed.";
+  }
+
+  return (
+    <>
+      <PanelSectionRow>
+        <CurveGraph
+          curve={curve}
+          selected={selected}
+          liveTemp={fan.temp}
+          livePwm={fan.pwm}
+          dimmed={busy}
+        />
+        <div className="ps5hw-note">
+          {fan.temp !== null && (
+            <span style={{ color: LIVE_COLOR }}>
+              SoC {formatTemp(fan.temp)}
+              {fan.pwm !== null ? ` · fan ${pwmToPercent(fan.pwm)}%` : ""}
+              {" · "}
+            </span>
+          )}
+          The diamond is where the fan stops. Above {FAN_CURVE_TEMP_MAX} °C the kernel always runs it at full speed.
+        </div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <SliderField
+          label="Edit Point"
+          description={pointDescription}
+          value={selected}
+          min={STOP_HANDLE}
+          max={curve.points.length}
+          step={1}
+          notchCount={curve.points.length + 1}
+          notchLabels={[STOP_HANDLE, ...curve.points.map((_, i) => i + 1)].map((handle) => ({
+            notchIndex: handle,
+            label: handle === STOP_HANDLE ? "Stop" : `${handle}`,
+            value: handle,
+          }))}
+          notchTicksVisible
+          disabled={busy}
+          onChange={select}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <SliderField
+          label={isStop ? "Stop Temperature" : "Temperature"}
+          description={`Allowed ${bounds.tempLow}–${bounds.tempHigh} °C`}
+          value={temp}
+          min={Math.min(FAN_CURVE_TEMP_MIN, temp)}
+          max={FAN_CURVE_TEMP_MAX}
+          step={1}
+          showValue
+          valueSuffix=" °C"
+          disabled={busy}
+          onChange={(value) => move(value, percent)}
+        />
+      </PanelSectionRow>
+      {!isStop && (
+        <PanelSectionRow>
+          <SliderField
+            label="Fan Speed"
+            description={speedDescription}
+            value={percent}
+            min={0}
+            max={100}
+            step={1}
+            showValue
+            valueSuffix="%"
+            disabled={busy || bounds.pwmLow === bounds.pwmHigh}
+            onChange={(value) => move(temp, value)}
+          />
+        </PanelSectionRow>
+      )}
+      <ButtonGrid columns={2}>
+        <DialogButton className="ps5hw-btn" disabled={busy || !edited} onClick={onRevert}>
+          <ButtonLabel icon={<FaUndo />} label="Revert" />
+        </DialogButton>
+        <DialogButton
+          className="ps5hw-btn"
+          disabled={busy || (!edited && fan.mode === FAN_MODE_CURVE)}
+          onClick={onApply}
+        >
+          <ButtonLabel icon={<FaCheck />} label="Apply Curve" busy={applying === "custom"} />
+        </DialogButton>
+      </ButtonGrid>
+    </>
+  );
+};
+
 const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
   const [status, setStatus] = useState<FanStatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [slider, setSlider] = useState<number>(FAN_DEFAULT);
+  const [curveDraft, setCurveDraft] = useState<FanCurve | null>(null);
+  const [view, setView] = useState<FanView | null>(lastFanView);
   const [applying, setApplying] = useState<string | null>(null);
   const [settings, setSettings] = useState<FanSettings | null>(null);
   const [savingSettings, setSavingSettings] = useState<boolean>(false);
@@ -416,6 +755,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const alive = useRef<boolean>(true);
   const polling = useRef<boolean>(false);
   const sliderTouched = useRef<boolean>(false);
+  const curveTouched = useRef<boolean>(false);
   const thresholdTimer = useRef<number | undefined>(undefined);
 
   const refreshStatus = useCallback(async (): Promise<FanStatusResult | null> => {
@@ -430,9 +770,12 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     }
     if (result.success) {
       setStatus(result.data);
-      setStatusError(result.data.target_error);
+      setStatusError(result.data.fan_error ?? result.data.target_error);
       if (!sliderTouched.current && result.data.target !== null) {
         setSlider(clamp(result.data.target, FAN_MIN, FAN_MAX));
+      }
+      if (!curveTouched.current && result.data.fan !== null) {
+        setCurveDraft(result.data.fan.curve);
       }
     } else {
       setStatusError(result.error);
@@ -468,6 +811,28 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     };
   }, [refreshStatus, call, notify]);
 
+  const mergeFan = (data: { curve?: FanCurve; mode?: number | null } | null) => {
+    if (!data) {
+      return;
+    }
+    setStatus((prev) =>
+      prev?.fan
+        ? {
+            ...prev,
+            fan: {
+              ...prev.fan,
+              ...(data.curve !== undefined ? { curve: data.curve } : {}),
+              ...(data.mode !== undefined ? { mode: data.mode } : {}),
+            },
+          }
+        : prev,
+    );
+    if (data.curve !== undefined) {
+      setCurveDraft(data.curve);
+      curveTouched.current = false;
+    }
+  };
+
   const applyTarget = async (source: string, temp: number) => {
     setApplying(source);
     const result = await call("set_fan_target", temp);
@@ -476,12 +841,49 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     }
     if (result.success) {
       setStatus((prev) => (prev ? { ...prev, target: result.data.temp } : prev));
+      mergeFan(result.data);
       setSlider(temp);
       sliderTouched.current = false;
     }
     notify(result);
     setApplying(null);
     refreshStatus();
+  };
+
+  const runFanUpdate = async (source: string, request: () => Promise<FanUpdateResult>) => {
+    setApplying(source);
+    const result = await request();
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      mergeFan(result.data);
+    }
+    notify(result);
+    setApplying(null);
+    refreshStatus();
+  };
+
+  const applyCurve = (source: string, curve: FanCurve | null) =>
+    runFanUpdate(source, () => (curve === null ? call("reset_fan_curve") : call("set_fan_curve", curve)));
+
+  const applyFullSpeed = () => runFanUpdate(FULL_SPEED_ID, () => call("set_fan_mode", FAN_MODE_FULL));
+
+  const editCurve = (curve: FanCurve) => {
+    curveTouched.current = true;
+    setCurveDraft(curve);
+  };
+
+  const revertCurve = () => {
+    if (status?.fan) {
+      setCurveDraft(status.fan.curve);
+    }
+    curveTouched.current = false;
+  };
+
+  const selectView = (next: FanView) => {
+    lastFanView = next;
+    setView(next);
   };
 
   const saveSettings = async (update: FanSettingsUpdate) => {
@@ -520,9 +922,44 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const guardEnabled = settings?.guard_enabled ?? false;
   const alarmEnabled = settings?.alarm_enabled ?? false;
   const protectionEnabled = guardEnabled || alarmEnabled;
+  const curveMode = status?.interface === "curve";
+  const fan = curveMode ? status?.fan ?? null : null;
+  const fullSpeed = fan?.mode === FAN_MODE_FULL;
+
+  let activeView: FanView = "target";
+  if (curveMode) {
+    activeView = view ?? (target !== null ? "target" : "curve");
+  }
+  const targetView = activeView === "target";
+
+  let viewNote: string | null = null;
+  if (status !== null && !curveMode) {
+    viewNote = "Fan curves need a kernel with the ps5_fan hwmon driver.";
+  } else if (curveMode && targetView) {
+    viewNote =
+      "This kernel controls the fan by curve, so a target is applied as a curve that reaches full speed just above it. Editing the curve replaces the target.";
+  }
+
+  let selectedCurvePreset: string | null = null;
+  if (fan?.mode === FAN_MODE_FULL) {
+    selectedCurvePreset = FULL_SPEED_ID;
+  } else if (fan?.mode === FAN_MODE_CURVE) {
+    selectedCurvePreset = curvePresetId(fan.curve);
+  }
+
+  let targetValue: ReactNode = "Unavailable";
+  if (loading) {
+    targetValue = <InlineSpinner />;
+  } else if (target !== null) {
+    targetValue = `${target} °C`;
+  } else if (fan !== null) {
+    targetValue = "Custom curve";
+  }
 
   let guardStatus = "Off";
-  if (guardEnabled && guard?.active) {
+  if (guardEnabled && guard?.active && guard.kind === "curve") {
+    guardStatus = "Cooling · full speed";
+  } else if (guardEnabled && guard?.active) {
     guardStatus = `Cooling · restores ${guard.restore_target ?? FAN_BOOT_TARGET} °C`;
   } else if (alarmEnabled && guard?.alarm_active) {
     guardStatus = "Overheated · alarm sounded";
@@ -532,10 +969,19 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     guardStatus = "Standby";
   }
 
-  const restoreDescription =
-    settings?.saved_target != null
-      ? `Re-applies ${settings.saved_target} °C when Decky starts. The kernel resets the target to ${FAN_BOOT_TARGET} °C at boot.`
-      : `Re-applies your last target when Decky starts. The kernel resets the target to ${FAN_BOOT_TARGET} °C at boot.`;
+  let restoreDescription: string;
+  let guardDescription: string;
+  if (curveMode) {
+    restoreDescription = `${
+      settings?.saved_curve ? "Re-applies your saved target or fan curve" : "Re-applies the last target or curve you apply"
+    } when Decky starts. The kernel resets the curve to its quiet default at boot.`;
+    guardDescription = `Run the fan at full speed when the CPU reaches the threshold, then go back to the previous mode once it is ${GUARD_HYSTERESIS} °C cooler.`;
+  } else {
+    restoreDescription = `${
+      settings?.saved_target != null ? `Re-applies ${settings.saved_target} °C` : "Re-applies your last target"
+    } when Decky starts. The kernel resets the target to ${FAN_BOOT_TARGET} °C at boot.`;
+    guardDescription = `Switch to Max Cooling (${FAN_MAX_COOLING} °C) when the CPU reaches the threshold, then restore your target once it is ${GUARD_HYSTERESIS} °C cooler.`;
+  }
 
   return (
     <>
@@ -559,11 +1005,23 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
             <Field label="No temperature sensors found" icon={<FaThermometerHalf />} />
           </PanelSectionRow>
         )}
-        <PanelSectionRow>
-          <Field label="Fan Target" icon={<FaWind />} description={statusError ?? undefined}>
-            {loading ? <InlineSpinner /> : target !== null ? `${target} °C` : "Unavailable"}
-          </Field>
-        </PanelSectionRow>
+        {curveMode ? (
+          <PanelSectionRow>
+            <Field
+              label="Fan"
+              icon={<FaWind />}
+              description={statusError ?? (fan !== null ? `Mode: ${fanModeLabel(fan.mode)}` : undefined)}
+            >
+              {fan?.pwm != null ? `${pwmToPercent(fan.pwm)}%` : "Unavailable"}
+            </Field>
+          </PanelSectionRow>
+        ) : (
+          <PanelSectionRow>
+            <Field label="Fan Target" icon={<FaWind />} description={statusError ?? undefined}>
+              {targetValue}
+            </Field>
+          </PanelSectionRow>
+        )}
         {(guard?.active || guard?.alarm_active) && (
           <PanelSectionRow>
             <Field label="Overheat" icon={<FaExclamationTriangle />}>
@@ -572,67 +1030,152 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           </PanelSectionRow>
         )}
       </PanelSection>
-      <PanelSection title="Presets">
-        {chunk(FAN_PRESETS, 2).map((row, rowIndex) => (
-          <ButtonGrid key={row.map((p) => p.id).join("|")} columns={2}>
-            {row.map((preset, index) => {
-              const selected = target === preset.temp;
-              return (
+      {status !== null && (
+        <PanelSection title="Fan Control">
+          <ButtonGrid columns={2}>
+            {FAN_VIEWS.map((option) => (
+              <DialogButton
+                key={option.id}
+                className="ps5hw-btn"
+                disabled={busy || (!curveMode && option.id === "curve")}
+                onClick={() => selectView(option.id)}
+                style={{ borderBottom: `2px solid ${activeView === option.id ? ACCENT : "transparent"}` }}
+              >
+                <div className="ps5hw-stack">
+                  <span>{option.label}</span>
+                  <span className="ps5hw-sub">{option.description}</span>
+                </div>
+              </DialogButton>
+            ))}
+          </ButtonGrid>
+          {viewNote && (
+            <PanelSectionRow>
+              <div className="ps5hw-note">{viewNote}</div>
+            </PanelSectionRow>
+          )}
+        </PanelSection>
+      )}
+      {targetView && (
+        <>
+          <PanelSection title="Presets">
+            {curveMode && (
+              <PanelSectionRow>
+                <Field label="Fan Target" icon={<FaWind />}>
+                  {fullSpeed ? "Full speed" : targetValue}
+                </Field>
+              </PanelSectionRow>
+            )}
+            {chunk(FAN_PRESETS, 2).map((row, rowIndex) => (
+              <ButtonGrid key={row.map((p) => p.id).join("|")} columns={2}>
+                {row.map((preset, index) => {
+                  const selected = target === preset.temp && !fullSpeed;
+                  return (
+                    <DialogButton
+                      key={preset.id}
+                      className={gridButtonClass(rowIndex * 2 + index, FAN_PRESETS.length, 2)}
+                      disabled={busy}
+                      onClick={() => applyTarget(preset.id, preset.temp)}
+                      style={{ borderBottom: `2px solid ${selected ? ACCENT : "transparent"}` }}
+                    >
+                      {applying === preset.id ? (
+                        <InlineSpinner />
+                      ) : (
+                        <div className="ps5hw-stack">
+                          <span>{preset.label}</span>
+                          <span className="ps5hw-sub">{preset.temp} °C</span>
+                        </div>
+                      )}
+                    </DialogButton>
+                  );
+                })}
+              </ButtonGrid>
+            ))}
+          </PanelSection>
+          <PanelSection title="Manual Target">
+            <PanelSectionRow>
+              <SliderField
+                label="Target Temperature (°C)"
+                description="Lower targets ramp the fan earlier and louder."
+                value={slider}
+                min={FAN_MIN}
+                max={FAN_MAX}
+                step={1}
+                showValue
+                valueSuffix=" °C"
+                resetValue={FAN_DEFAULT}
+                notchCount={2}
+                notchLabels={[
+                  { notchIndex: 0, label: `${FAN_MIN}`, value: FAN_MIN },
+                  { notchIndex: 1, label: `${FAN_MAX}`, value: FAN_MAX },
+                ]}
+                disabled={busy}
+                onChange={(value) => {
+                  sliderTouched.current = true;
+                  setSlider(value);
+                }}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                disabled={busy || loading || (slider === target && !fullSpeed)}
+                onClick={() => applyTarget("manual", slider)}
+              >
+                <ButtonLabel icon={<FaWind />} label="Apply Target" busy={applying === "manual"} />
+              </ButtonItem>
+            </PanelSectionRow>
+          </PanelSection>
+        </>
+      )}
+      {!targetView && (
+        <>
+          <PanelSection title="Curve Presets">
+            <ButtonGrid columns={2}>
+              {[...FAN_CURVE_PRESETS, FULL_SPEED_PRESET].map((preset) => (
                 <DialogButton
                   key={preset.id}
-                  className={gridButtonClass(rowIndex * 2 + index, FAN_PRESETS.length, 2)}
-                  disabled={busy}
-                  onClick={() => applyTarget(preset.id, preset.temp)}
-                  style={{ borderBottom: `2px solid ${selected ? ACCENT : "transparent"}` }}
+                  className="ps5hw-btn"
+                  disabled={busy || fan === null}
+                  onClick={() =>
+                    preset.id === FULL_SPEED_ID ? applyFullSpeed() : applyCurve(preset.id, preset.curve)
+                  }
+                  style={{
+                    borderBottom: `2px solid ${selectedCurvePreset === preset.id ? ACCENT : "transparent"}`,
+                  }}
                 >
                   {applying === preset.id ? (
                     <InlineSpinner />
                   ) : (
                     <div className="ps5hw-stack">
                       <span>{preset.label}</span>
-                      <span className="ps5hw-sub">{preset.temp} °C</span>
+                      <span className="ps5hw-sub">{preset.subtitle}</span>
                     </div>
                   )}
                 </DialogButton>
-              );
-            })}
-          </ButtonGrid>
-        ))}
-      </PanelSection>
-      <PanelSection title="Manual Target">
-        <PanelSectionRow>
-          <SliderField
-            label="Target Temperature (°C)"
-            description="Lower targets ramp the fan earlier and louder."
-            value={slider}
-            min={FAN_MIN}
-            max={FAN_MAX}
-            step={1}
-            showValue
-            valueSuffix=" °C"
-            resetValue={FAN_DEFAULT}
-            notchCount={2}
-            notchLabels={[
-              { notchIndex: 0, label: `${FAN_MIN}`, value: FAN_MIN },
-              { notchIndex: 1, label: `${FAN_MAX}`, value: FAN_MAX },
-            ]}
-            disabled={busy}
-            onChange={(value) => {
-              sliderTouched.current = true;
-              setSlider(value);
-            }}
-          />
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            disabled={busy || loading || slider === target}
-            onClick={() => applyTarget("manual", slider)}
-          >
-            <ButtonLabel icon={<FaWind />} label="Apply Target" busy={applying === "manual"} />
-          </ButtonItem>
-        </PanelSectionRow>
-      </PanelSection>
+              ))}
+            </ButtonGrid>
+          </PanelSection>
+          <PanelSection title="Fan Curve">
+            {fan !== null && curveDraft !== null ? (
+              <FanCurveEditor
+                curve={curveDraft}
+                fan={fan}
+                busy={busy}
+                applying={applying}
+                onChange={editCurve}
+                onApply={() => applyCurve("custom", curveDraft)}
+                onRevert={revertCurve}
+              />
+            ) : (
+              <PanelSectionRow>
+                <Field label="Fan curve" description={statusError ?? undefined}>
+                  {statusError ? "Unavailable" : <InlineSpinner />}
+                </Field>
+              </PanelSectionRow>
+            )}
+          </PanelSection>
+        </>
+      )}
       <PanelSection title="Advanced">
         <PanelSectionRow>
           <ToggleField
@@ -646,7 +1189,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         <PanelSectionRow>
           <ToggleField
             label="Thermal Guard"
-            description={`Switch to Max Cooling (${FAN_MAX_COOLING} °C) when the CPU reaches the threshold, then restore your target once it is ${GUARD_HYSTERESIS} °C cooler.`}
+            description={guardDescription}
             checked={guardEnabled}
             disabled={settings === null || savingSettings}
             onChange={(checked) => saveSettings({ guard_enabled: checked })}
