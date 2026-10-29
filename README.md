@@ -114,6 +114,14 @@ GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ` (ps5-linux-patches, 
 - **Loop Animations**: the firmware plays breathe and pulse animations once. This option replays them on an interval you choose (2–30 s), and keeps going in the background.
 - **Restore on Startup**: re-applies your last LED preset when Decky starts.
 
+## Translations
+
+The plugin follows the language exposed by Decky's browser UI. English is the
+built-in fallback and Swedish is included. UI text is routed through the small
+catalog in `src/i18n.ts`; to add another language, add its ISO language code
+and translations to `catalogs`. No component changes or external translation
+service are required.
+
 ## Credits
 
 - [rmuxnet/ps5-linux-patches](https://github.com/rmuxnet/ps5-linux-patches-1) for the kernel drivers this plugin builds on.
