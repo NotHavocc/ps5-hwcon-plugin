@@ -1,10 +1,12 @@
 import asyncio
 import errno
+import glob
 import gzip
 import json
 import os
 import re
 import shutil
+import subprocess
 import threading
 import time
 
@@ -68,6 +70,7 @@ GUARD_DEFAULT = 95
 GUARD_HYSTERESIS = 10
 GUARD_POLL_SECONDS = 3.0
 
+BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
 LED_CLASS_DIR = "/sys/class/leds"
 LED_PREFIX = "ps5:"
 LED_SUFFIX = ":indicator"
@@ -90,6 +93,31 @@ DEVFREQ_DIR = "/sys/class/devfreq"
 GPU_DEVFREQ_NAME = "ps5-gpufreq"
 GPU_DEVFREQ_PATH = f"{DEVFREQ_DIR}/{GPU_DEVFREQ_NAME}"
 GPU_KCONFIG_OPTION = "CONFIG_PS5_GPUFREQ"
+CU_UNLOCK_PARAM_PATH = "/sys/module/amdgpu/parameters/ps5_cu_unlock"
+CU_UNLOCK_ARG = "amdgpu.ps5_cu_unlock"
+CU_UNLOCK_ALL = 3
+CU_UNLOCK_PATTERN = re.compile(r"(?:^|\s+)amdgpu\.ps5[-_]cu[-_]unlock=(\S*)")
+CU_MASK_PARAM_PATH = "/sys/module/amdgpu/parameters/disable_cu"
+CU_MASK_ARG = "amdgpu.disable_cu"
+CU_MASK_PATTERN = re.compile(r"(?:^|\s+)amdgpu\.disable[-_]cu=(\S*)")
+CU_MASK_38 = "0.0.0"
+CU_TARGETS = {0: (0, None), 38: (CU_UNLOCK_ALL, CU_MASK_38), 40: (CU_UNLOCK_ALL, None)}
+ACTIVE_CU_PATTERN = re.compile(r"active_cu_number (\d+)")
+
+BOOT_MOUNT = "/boot/efi"
+BOOT_EFI_MOUNT = "/efi"
+BOOT_RUN_MOUNT = "/run/ps5-hwcon/boot"
+BOOT_SUBDIRS = ("", "PS5/Linux")
+MOUNTS_PATH = "/proc/self/mounts"
+BOOT_FILESYSTEMS = ("vfat", "exfat")
+BOOT_CMDLINE_MAX = 2047
+RUNNING_CMDLINE_PATH = "/proc/cmdline"
+VRAM_TOTAL_GLOB = "/sys/class/drm/card[0-9]*/device/mem_info_vram_total"
+VRAM_DEFAULT_BYTES = 512 * 1024 * 1024
+VRAM_CHOICES_MB = (512, 1024, 2048, 4096, 8192)
+GTT_CHOICES_GB = (10, 12)
+GTT_ARG = "ttm.pages_limit"
+GTT_PATTERN = re.compile(r"(?:^|\s+)ttm\.pages[-_]limit=(\S*)")
 GPU_HIDDEN_GOVERNORS = ("passive",)
 
 BUZZER_DIR = "/sys/class/misc/ps5_buzzer"
@@ -120,6 +148,7 @@ DEFAULT_SETTINGS = {
     "led_loop_seconds": LED_LOOP_DEFAULT,
     "led_restore_on_boot": False,
     "saved_led_preset": None,
+    "saved_led_boot_id": None,
     "cpu_restore_on_boot": False,
     "saved_governor": None,
     "gpu_restore_on_boot": False,
@@ -130,6 +159,7 @@ DEFAULT_SETTINGS = {
 
 _fan_lock = asyncio.Lock()
 _led_lock = asyncio.Lock()
+_boot_lock = asyncio.Lock()
 _cpu_lock = asyncio.Lock()
 _gpu_lock = asyncio.Lock()
 _buzzer_lock = asyncio.Lock()
@@ -487,6 +517,9 @@ def _sanitize_settings(raw):
     led_preset = raw.get("saved_led_preset")
     if isinstance(led_preset, str) and LED_PRESET_PATTERN.fullmatch(led_preset):
         settings["saved_led_preset"] = led_preset
+    led_boot_id = raw.get("saved_led_boot_id")
+    if isinstance(led_boot_id, str):
+        settings["saved_led_boot_id"] = led_boot_id
     settings["cpu_restore_on_boot"] = raw.get("cpu_restore_on_boot") is True
     governor = raw.get("saved_governor")
     if isinstance(governor, str) and CPU_GOVERNOR_PATTERN.fullmatch(governor):
@@ -738,6 +771,24 @@ async def _guard_loop():
 
 def _is_animated(preset):
     return bool(preset) and preset != LED_OFF_PRESET and bool(LED_ANIMATED_PATTERN.search(preset))
+
+
+def _current_boot_id():
+    try:
+        return _read_sysfs(BOOT_ID_PATH)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+async def _remember_led_preset(preset):
+    await _remember_setting("saved_led_preset", preset)
+    await _remember_setting("saved_led_boot_id", _current_boot_id())
+
+
+def _resume_led_preset():
+    boot_id = _current_boot_id()
+    if boot_id and boot_id == _settings["saved_led_boot_id"]:
+        _led["preset"] = _settings["saved_led_preset"]
 
 
 def _led_settings_snapshot():
@@ -1178,8 +1229,8 @@ async def _describe_missing_gpufreq():
         value = None
     if value == "n":
         return (
-            f"This kernel was built without {GPU_KCONFIG_OPTION}. "
-            "Install a ps5-linux-patches kernel that enables it."
+            f"This kernel was built without {GPU_KCONFIG_OPTION}, "
+            "so GPU governors and clock locks aren't available."
         )
     if value == "m":
         return (
@@ -1192,6 +1243,342 @@ async def _describe_missing_gpufreq():
             "Check dmesg for probe errors."
         )
     return f"{GPU_DEVFREQ_PATH} does not exist. Is the kernel built with {GPU_KCONFIG_OPTION}?"
+
+
+BOOT_FILES_MISSING = "The boot partition wasn't found. Mount it at /boot/efi and try again."
+_boot_problem = None
+
+
+def _boot_missing():
+    if _boot_problem:
+        return f"The boot partition wasn't found. {_boot_problem}"
+    return BOOT_FILES_MISSING
+
+
+def _boot_file_in(mount, name):
+    for subdir in BOOT_SUBDIRS:
+        path = os.path.join(mount, subdir, name)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _run_command(*args):
+    try:
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=IO_TIMEOUT_SECONDS,
+            env=_subprocess_env(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _command_ok(*args):
+    result = _run_command(*args)
+    return result is not None and result.returncode == 0
+
+
+def _command_error(result, name):
+    if result is None:
+        return f"{name} couldn't be run."
+    return f"{name} failed: {result.stderr.strip() or f'exit code {result.returncode}'}."
+
+
+def _root_argument(line):
+    match = re.search(r"(?:^|\s)root=(\S+)", line)
+    return match.group(1) if match else None
+
+
+def _running_root():
+    try:
+        return _root_argument(_read_sysfs(RUNNING_CMDLINE_PATH))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _cmdline_root(mount):
+    path = _boot_file_in(mount, "cmdline.txt")
+    try:
+        return _root_argument(_split_cmdline(_read_cmdline_sync(path))[0])
+    except OSError:
+        return None
+
+def _fat_mounts():
+    mounts = [BOOT_MOUNT, BOOT_EFI_MOUNT]
+    try:
+        with open(MOUNTS_PATH, encoding="utf-8", errors="replace") as handle:
+            rows = [row.split() for row in handle]
+    except OSError:
+        return mounts
+    for row in rows:
+        if len(row) >= 3 and row[2] in BOOT_FILESYSTEMS:
+            mount = re.sub(r"\\(\d{3})", lambda code: chr(int(code.group(1), 8)), row[1])
+            mounts.append(mount)
+    return mounts
+
+def _boot_mount():
+    mounts = [mount for mount in _fat_mounts() if _boot_file_in(mount, "cmdline.txt")]
+    root = _running_root()
+    matching = [mount for mount in mounts if _cmdline_root(mount) == root]
+    return (matching or mounts or [None])[0]
+
+
+def _boot_file(name):
+    mount = _boot_mount()
+    return _boot_file_in(mount, name) if mount else None
+
+
+def _boot_partitions(problems):
+    result = _run_command("lsblk", "-rpno", "NAME,FSTYPE")
+    if result is None or result.returncode != 0:
+        problems.append(_command_error(result, "lsblk"))
+        return []
+    rows = (row.split() for row in result.stdout.splitlines())
+    return [row[0] for row in rows if len(row) == 2 and row[1] in BOOT_FILESYSTEMS]
+
+
+def _boot_mount_target():
+    for path in (BOOT_MOUNT, BOOT_RUN_MOUNT):
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            continue
+        if not os.path.ismount(os.path.realpath(path)):
+            return path
+    return None
+
+
+def _probe_boot_partition(device, target, roots, problems):
+    result = _run_command("mount", "-o", "ro", device, target)
+    if result is None or result.returncode != 0:
+        problems.append(_command_error(result, f"Mounting {device}"))
+        return
+    try:
+        if _boot_file_in(target, "cmdline.txt"):
+            roots[device] = _cmdline_root(target)
+        else:
+            problems.append(f"{device} has no cmdline.txt.")
+    finally:
+        _command_ok("umount", target)
+
+
+def _ensure_boot_mounted_sync():
+    global _boot_problem
+    _boot_problem = None
+    root = _running_root()
+    found = _boot_mount()
+    if found and _cmdline_root(found) == root:
+        return
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        if not found:
+            _boot_problem = "Looking for it needs root."
+        return
+    if not os.path.ismount(os.path.realpath(BOOT_MOUNT)):
+        _command_ok("mount", BOOT_MOUNT)
+        found = _boot_mount()
+        if found and _cmdline_root(found) == root:
+            return
+
+    target = _boot_mount_target()
+    if target is None:
+        _boot_problem = f"Nowhere to mount it: {BOOT_MOUNT} and {BOOT_RUN_MOUNT} are in use."
+        return
+    problems = []
+    partitions = _boot_partitions(problems)
+    roots = {}
+    for device in partitions:
+        _probe_boot_partition(device, target, roots, problems)
+    matching = [device for device, value in roots.items() if value == root]
+    if found and not matching:
+        return
+    choices = matching or list(roots)
+    if len(choices) == 1:
+        result = _run_command("mount", "-o", "ro", choices[0], target)
+        if result is None or result.returncode != 0:
+            _boot_problem = _command_error(result, f"Mounting {choices[0]}")
+    elif choices:
+        logger.warning(f"Not mounting a boot partition, several could match: {choices}")
+        _boot_problem = f"Several partitions could be it: {', '.join(choices)}."
+    elif problems:
+        _boot_problem = " ".join(problems)
+    elif not partitions:
+        _boot_problem = "No FAT partition is connected. Is the boot USB drive plugged in?"
+
+
+async def _ensure_boot_mounted():
+    try:
+        await _run_detached(_ensure_boot_mounted_sync)
+    except Exception as exc:
+        logger.warning(f"Mounting the boot partition failed: {exc}")
+
+
+def _with_writable_boot(func, *args):
+    mount = _boot_mount()
+    read_only = bool(os.statvfs(mount).f_flag & os.ST_RDONLY)
+    if read_only and not _command_ok("mount", "-o", "remount,rw", mount):
+        return f"{mount} couldn't be made writable"
+    try:
+        return func(*args)
+    finally:
+        if read_only and not _command_ok("mount", "-o", "remount,ro", mount):
+            logger.warning(f"{mount} couldn't be made read-only again")
+
+
+def _split_cmdline(text):
+    match = re.search(r"[\r\n]", text)
+    end = match.start() if match else len(text)
+    return text[:end], text[end:]
+
+
+def _read_cmdline_sync(path):
+    with open(path, "rb") as handle:
+        return handle.read().decode("latin-1")
+
+
+def _write_file_synced(path, data):
+    with open(path, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _replace_file_sync(path, data, backup=None):
+    if backup is not None:
+        _write_file_synced(f"{path}.bak", backup)
+    temporary = f"{path}.tmp"
+    _write_file_synced(temporary, data)
+    os.replace(temporary, path)
+    directory = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _set_cmdline_args_sync(path, changes):
+    original = _read_cmdline_sync(path)
+    line, rest = _split_cmdline(original)
+    if not line.strip():
+        return f"{path} has no kernel command line on its first line"
+    updated = line
+    for pattern, argument in changes:
+        updated = pattern.sub("", updated).strip()
+        if argument:
+            updated = f"{updated} {argument}"
+    if len(updated) > BOOT_CMDLINE_MAX:
+        return f"{path} would exceed the loader's {BOOT_CMDLINE_MAX} character limit"
+    if updated == line:
+        return None
+    _replace_file_sync(path, (updated + rest).encode("latin-1"), original.encode("latin-1"))
+    return None
+
+
+def _parse_vram(text):
+    match = re.match(r"\s*(?:0[xX])?([0-9a-fA-F]+)", text)
+    return (int(match.group(1), 16) if match else 0) or VRAM_DEFAULT_BYTES
+
+
+def _write_vram_sync(path, size):
+    original = None
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            original = handle.read()
+    data = f"{size:x}\n".encode("ascii")
+    if data != original:
+        _replace_file_sync(path, data, original)
+
+
+def _cmdline_pages(line):
+    values = GTT_PATTERN.findall(line)
+    return _coerce_int(values[-1]) if values else None
+
+
+def _read_running_vram():
+    for path in sorted(glob.glob(VRAM_TOTAL_GLOB)):
+        try:
+            return _coerce_int(_read_sysfs(path))
+        except (OSError, UnicodeDecodeError):
+            continue
+    return None
+
+
+def _read_gpu_memory_sync():
+    cmdline_path = _boot_file("cmdline.txt")
+    vram_path = _boot_file("vram.txt")
+    vram = VRAM_DEFAULT_BYTES
+    if vram_path is not None:
+        vram = _parse_vram(_read_sysfs(vram_path))
+    gtt_pages = None
+    if cmdline_path is not None:
+        gtt_pages = _cmdline_pages(_split_cmdline(_read_cmdline_sync(cmdline_path))[0])
+    try:
+        booted_pages = _cmdline_pages(_read_sysfs(RUNNING_CMDLINE_PATH))
+    except (OSError, UnicodeDecodeError):
+        booted_pages = gtt_pages
+    return {
+        "boot_ready": cmdline_path is not None,
+        "boot_error": None if cmdline_path else _boot_missing(),
+        "vram_running": _read_running_vram(),
+        "vram_configured": vram,
+        "gtt_pages": gtt_pages,
+        "gtt_pending": gtt_pages != booted_pages,
+    }
+
+
+def _read_active_cus():
+    result = _run_command("dmesg")
+    if result is None:
+        return None
+    counts = ACTIVE_CU_PATTERN.findall(result.stdout)
+    return int(counts[-1]) if counts else None
+
+
+def _read_running_cu_mask():
+    try:
+        mask = _read_sysfs(CU_MASK_PARAM_PATH)
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None if mask in ("", "(null)") else mask
+
+
+def _cu_target(mode, mask):
+    for target, wanted in CU_TARGETS.items():
+        if (mode, mask) == wanted:
+            return target
+    return None
+
+
+def _read_cu_unlock_sync():
+    try:
+        running = _coerce_int(_read_sysfs(CU_UNLOCK_PARAM_PATH))
+    except (OSError, UnicodeDecodeError):
+        running = None
+    running_mask = _read_running_cu_mask()
+    path = _boot_file("cmdline.txt")
+    configured = None
+    configured_mask = None
+    if path is not None:
+        line, _rest = _split_cmdline(_read_cmdline_sync(path))
+        values = CU_UNLOCK_PATTERN.findall(line)
+        configured = (_coerce_int(values[-1]) if values else 0) or 0
+        masks = CU_MASK_PATTERN.findall(line)
+        configured_mask = (masks[-1] if masks else None) or None
+    return {
+        "running": running,
+        "running_mask": running_mask,
+        "running_target": _cu_target(running, running_mask),
+        "configured": configured,
+        "configured_mask": configured_mask,
+        "configured_target": _cu_target(configured, configured_mask),
+        "pending": (configured, configured_mask) != (running, running_mask),
+        "cmdline_path": path,
+        "boot_error": None if path else _boot_missing(),
+        "active_cus": _read_active_cus(),
+    }
 
 
 async def _read_gpufreq():
@@ -1356,7 +1743,10 @@ async def _restore_led():
         return False, f"LED class interface missing at {LED_CLASS_DIR}"
     async with _led_lock:
         ok, error = await _apply_led_preset_locked("Restoring LED preset", preset)
-    return (True, f"Restored LED preset '{preset}'") if ok else (False, error)
+    if not ok:
+        return False, error
+    await _remember_led_preset(preset)
+    return True, f"Restored LED preset '{preset}'"
 
 
 _RESTORES = (
@@ -1682,7 +2072,7 @@ class Plugin:
         if not ok:
             return _fail(error)
 
-        await _remember_setting("saved_led_preset", preset)
+        await _remember_led_preset(preset)
         return _ok(f"LED preset '{preset}' applied", {"preset": preset, **_led_settings_snapshot()})
 
     async def get_cpu_status(self):
@@ -1793,6 +2183,115 @@ class Plugin:
 
         return _ok("GPU settings saved", _gpu_settings_snapshot())
 
+    async def get_cu_unlock(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, result = await _guarded_io(
+                "Reading CU unlock", CU_UNLOCK_PARAM_PATH, _read_cu_unlock_sync
+            )
+        if not ok:
+            return _fail(result)
+        return _ok("CU unlock read", result, log=False)
+
+    async def set_cu_unlock(self, target):
+        if target not in CU_TARGETS:
+            return _fail(f"Unsupported CU count: {target!r}")
+        mode, mask = CU_TARGETS[target]
+        async with _boot_lock:
+            if not os.path.exists(CU_UNLOCK_PARAM_PATH):
+                return _fail(f"This kernel doesn't support {CU_UNLOCK_ARG}")
+            await _ensure_boot_mounted()
+            path = _boot_file("cmdline.txt")
+            if path is None:
+                return _fail(_boot_missing())
+            changes = (
+                (CU_UNLOCK_PATTERN, f"{CU_UNLOCK_ARG}={mode}" if mode else None),
+                (CU_MASK_PATTERN, f"{CU_MASK_ARG}={mask}" if mask else None),
+            )
+            ok, result = await _guarded_io(
+                "Updating cmdline.txt",
+                path,
+                _with_writable_boot,
+                _set_cmdline_args_sync,
+                path,
+                changes,
+            )
+            if not ok or result:
+                return _fail(result)
+            ok, status = await _guarded_io(
+                "Reading CU unlock", CU_UNLOCK_PARAM_PATH, _read_cu_unlock_sync
+            )
+        if not ok:
+            return _fail(status)
+        state = f"set to {target} CUs" if target else "disabled"
+        return _ok(f"CU unlock {state} in cmdline.txt. Reboot to apply.", status)
+
+    async def get_gpu_memory(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, result = await _guarded_io(
+                "Reading GPU memory settings", BOOT_MOUNT, _read_gpu_memory_sync
+            )
+        if not ok:
+            return _fail(result)
+        return _ok("GPU memory read", result, log=False)
+
+    async def set_vram(self, megabytes):
+        if megabytes not in VRAM_CHOICES_MB:
+            return _fail(f"Unsupported VRAM size: {megabytes!r}")
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            cmdline_path = _boot_file("cmdline.txt")
+            if cmdline_path is None:
+                return _fail(_boot_missing())
+            path = _boot_file("vram.txt") or os.path.join(
+                os.path.dirname(cmdline_path), "vram.txt"
+            )
+            ok, error = await _guarded_io(
+                "Updating vram.txt",
+                path,
+                _with_writable_boot,
+                _write_vram_sync,
+                path,
+                megabytes * 1024 * 1024,
+            )
+            if not ok or error:
+                return _fail(error)
+            ok, status = await _guarded_io(
+                "Reading GPU memory settings", path, _read_gpu_memory_sync
+            )
+        if not ok:
+            return _fail(status)
+        return _ok(f"VRAM set to {megabytes} MB in vram.txt. Reboot to apply.", status)
+
+    async def set_gtt_limit(self, gigabytes):
+        if gigabytes is not None and gigabytes not in GTT_CHOICES_GB:
+            return _fail(f"Unsupported GTT limit: {gigabytes!r}")
+        argument = None
+        if gigabytes is not None:
+            argument = f"{GTT_ARG}={gigabytes * 1024 * 1024 // 4}"
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            path = _boot_file("cmdline.txt")
+            if path is None:
+                return _fail(_boot_missing())
+            ok, result = await _guarded_io(
+                "Updating cmdline.txt",
+                path,
+                _with_writable_boot,
+                _set_cmdline_args_sync,
+                path,
+                ((GTT_PATTERN, argument),),
+            )
+            if not ok or result:
+                return _fail(result)
+            ok, status = await _guarded_io(
+                "Reading GPU memory settings", path, _read_gpu_memory_sync
+            )
+        if not ok:
+            return _fail(status)
+        return _ok("GTT limit saved in cmdline.txt. Reboot to apply.", status)
+
     async def _main(self):
         global _guard_task, _led_loop_task, _restore_task
         logger.info("PS5 Hardware Control loaded")
@@ -1805,6 +2304,7 @@ class Plugin:
             logger.warning(await _describe_missing_gpufreq())
 
         await _ensure_settings()
+        _resume_led_preset()
         failed = await _restore_round(_RESTORES)
         if failed:
             _restore_task = asyncio.create_task(_restore_retry_loop(failed))

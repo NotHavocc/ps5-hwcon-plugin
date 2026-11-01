@@ -66,7 +66,7 @@ This link always points to the newest release, so entering it again updates the 
 
 ### Requirements
 
-- A PS5 running Linux with the [ps5-linux-patches](https://github.com/rmuxnet/ps5-linux-patches-1) kernel booted. The plugin only talks to the sysfs interfaces that kernel adds.
+- A PS5 running Linux with the [ps5-linux-patches](https://github.com/ps5-linux/ps5-linux-patches) kernel booted. The plugin only talks to the sysfs interfaces that kernel adds.
 - [Decky Loader](https://decky.xyz) 3.0 or newer. On Bazzite: `ujust setup-decky`.
 - `git`, plus either Node.js 18+ or podman/docker for the build.
 
@@ -74,7 +74,7 @@ This link always points to the newest release, so entering it again updates the 
 
 ### Fan
 
-**Fan Control** switches between **Target** (the original control) and **Curve**. Fan curves need a kernel with the `ps5_fan` hwmon driver (rmuxnet/ps5-linux-patches-1 `meower` from [`883eef9`](https://github.com/rmuxnet/ps5-linux-patches-1/commit/883eef9)); without it the tab opens on Target and Curve is greyed out. Those kernels drop `target_temp`, so there a target is applied as a curve that reaches 45% at the target and full speed 6 °C above it.
+**Fan Control** switches between **Target** (the original control) and **Curve**. Fan curves need a kernel with the `ps5_fan` hwmon driver, which ps5-linux-patches includes from 7.2.3 ([#60](https://github.com/ps5-linux/ps5-linux-patches/pull/60)). The plugin and installer look for that device rather than the kernel version, so any kernel carrying the driver works. Without it the tab opens on Target and Curve is greyed out. Kernels with the driver drop `target_temp`, so there a target is applied as a curve that reaches 45% at the target and full speed 6 °C above it.
 
 - **Temperatures**: live CPU (`k10temp`) readings, plus any other hwmon sensors, refreshed every 2 s. On curve kernels the fan's current speed and mode are shown too.
 - **Fan curve** (hwmon kernels): the graph shows the 8 curve points (SoC temperature → fan speed), the stop temperature (diamond) and the live SoC temperature and fan speed. Pick a point with **Edit Point**, set its **Temperature** and **Fan Speed** with the sliders, then **Apply Curve**. The sliders keep the curve valid for the driver: temperatures rise from point to point, speed never drops, and the last point is 100%. Above 90 °C the kernel runs the fan at full speed no matter what.
@@ -105,12 +105,17 @@ With an EPP driver such as `amd-pstate-epp`, the kernel only offers Performance 
 - **Manual Clock**: locks the GPU to one of the frequencies in `available_frequencies` by setting the devfreq `min_freq` and `max_freq` to the same value. The lock applies under any governor. **Automatic** removes both limits.
 - **Restore on Startup**: re-applies your last GPU governor and clock lock when Decky starts.
 
-GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ` (ps5-linux-patches, October 2026 or newer). While the CPU runs at a boost clock (3.3–3.5 GHz), the firmware takes over the GPU clock and holds it at the 2.23 GHz ceiling, regardless of the GPU governor or clock lock.
+- **CU Unlock**: turns on the compute units disabled at the factory (36 or 38 active out of 40). **40 CUs** adds `amdgpu.ps5_cu_unlock=3` to `cmdline.txt` on the boot drive, and **38 CUs** also adds `amdgpu.disable_cu=0.0.0` to mask one pair, so both need a reboot. **Off** removes both arguments, including a `disable_cu` you added yourself. The previous file is kept as `cmdline.txt.bak`. **Active CUs** shows the count the driver reported. Only an even split across both shader engines helps performance, so 38 CUs usually scores the same as 36. Some disabled CUs can be faulty, and the pair masked for 38 CUs is always the same one, so it may not avoid them. If you see glitches, try `RADV_DEBUG=nohiz`, then turn this off. If the screen is unusable, remove the arguments over SSH or from another computer.
+- **GPU Memory**: **VRAM** writes `vram.txt` on the boot drive, in the hex format the loader expects, and warns if the existing value looks wrong. It's a minimum that stays reserved from system RAM, so 512 MB suits most games. **GTT Limit** sets `ttm.pages_limit` in `cmdline.txt`, which raises how much system RAM the GPU can use without reserving it, so try this first if a game runs out of memory. Both need a reboot. See the [guide](https://rmuxnet.gitlab.io/ps5-linux-guide/guide/gpu#vram) for how the two interact.
+- **Boot partition**: CU Unlock and GPU Memory edit files on the FAT partition the console booted from, wherever the distro or desktop mounted it. If it isn't mounted, the plugin mounts it read-only at `/boot/efi` (or `/run/ps5-hwcon/boot` if that's taken), and only makes it writable while saving. It picks the partition whose `cmdline.txt` has the running `root=` argument. If it can't find one, or can't tell which one that is, the GPU tab shows why.
+
+GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ`. The driver isn't part of [ps5-linux-patches](https://github.com/ps5-linux/ps5-linux-patches) itself, so on those kernels the GPU tab shows why it's unavailable and everything else works normally. While the CPU runs at a boost clock (3.3–3.5 GHz), the firmware takes over the GPU clock and holds it at the 2.23 GHz ceiling, regardless of the GPU governor or clock lock.
 
 ### LED
 
 - Quick buttons for Off, White Bright, Blue Rich, Purple, Orange Breathe and Pink Breathe.
 - A searchable list of every preset the kernel exposes.
+- The active preset survives a Decky restart. After a reboot it shows as unknown until you pick a preset (or Restore on Startup does), because the kernel picks its own default LED.
 - **Loop Animations**: the firmware plays breathe and pulse animations once. This option replays them on an interval you choose (2–30 s), and keeps going in the background.
 - **Restore on Startup**: re-applies your last LED preset when Decky starts.
 

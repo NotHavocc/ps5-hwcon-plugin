@@ -75,9 +75,33 @@ ok "Found $PLUGINS_DIR"
 
 step "Checking PS5 kernel interfaces"
 missing=0
-for path in /sys/bus/platform/devices/ps5-fan/target_temp /sys/class/misc/ps5_buzzer/beep; do
-  if [ -e "$path" ]; then ok "$path"; else warn "missing: $path"; missing=1; fi
-done
+find_fan_hwmon() {
+  local name_file
+  for name_file in /sys/class/hwmon/hwmon*/name; do
+    if [ "$(cat "$name_file" 2>/dev/null)" = "ps5_fan" ]; then
+      dirname "$name_file"
+      return 0
+    fi
+  done
+  return 1
+}
+FAN_TARGET="/sys/bus/platform/devices/ps5-fan/target_temp"
+if fan_hwmon="$(find_fan_hwmon)"; then
+  ok "$fan_hwmon (ps5_fan, fan curves available)"
+elif [ -e "$FAN_TARGET" ]; then
+  ok "$FAN_TARGET (no ps5_fan hwmon driver, so no fan curves)"
+else
+  warn "missing: ps5_fan hwmon device or $FAN_TARGET"
+  missing=1
+fi
+BUZZER="/sys/class/misc/ps5_buzzer/beep"
+if [ -e "$BUZZER" ]; then ok "$BUZZER"; else warn "missing: $BUZZER"; missing=1; fi
+GPU_DEVFREQ="/sys/class/devfreq/ps5-gpufreq"
+if [ -e "$GPU_DEVFREQ" ]; then
+  ok "$GPU_DEVFREQ"
+else
+  warn "no $GPU_DEVFREQ, so the GPU tab won't be able to change governors or clocks (optional)"
+fi
 led_nodes=(/sys/class/leds/ps5:*)
 if [ -e "${led_nodes[0]}" ]; then
   ok "/sys/class/leds/ps5:*"

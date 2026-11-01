@@ -158,6 +158,28 @@ export interface GpuSettings {
   saved_clock: number | null;
 }
 
+export interface CuUnlockData {
+  running: number | null;
+  running_mask: string | null;
+  running_target: number | null;
+  configured: number | null;
+  configured_mask: string | null;
+  configured_target: number | null;
+  pending: boolean;
+  cmdline_path: string | null;
+  boot_error: string | null;
+  active_cus: number | null;
+}
+
+export interface GpuMemoryData {
+  boot_ready: boolean;
+  boot_error: string | null;
+  vram_running: number | null;
+  vram_configured: number;
+  gtt_pages: number | null;
+  gtt_pending: boolean;
+}
+
 export interface GovernorInfo {
   label: string;
   description: string;
@@ -175,6 +197,8 @@ export type CpuStatusResult = BackendResult<CpuStatusData>;
 export type CpuSettingsResult = BackendResult<CpuSettings>;
 export type GpuStatusResult = BackendResult<GpuStatusData>;
 export type GpuSettingsResult = BackendResult<GpuSettings>;
+export type CuUnlockResult = BackendResult<CuUnlockData>;
+export type GpuMemoryResult = BackendResult<GpuMemoryData>;
 
 export type FanSettingsArgs = [
   restore_on_boot: boolean | null,
@@ -214,6 +238,11 @@ export interface BackendMethods {
   set_gpu_clock: { args: [mhz: number | null]; result: GpuStatusResult };
   get_gpu_settings: { args: []; result: GpuSettingsResult };
   set_gpu_settings: { args: [restore_on_boot: boolean]; result: GpuSettingsResult };
+  get_cu_unlock: { args: []; result: CuUnlockResult };
+  set_cu_unlock: { args: [target: number]; result: CuUnlockResult };
+  get_gpu_memory: { args: []; result: GpuMemoryResult };
+  set_vram: { args: [megabytes: number]; result: GpuMemoryResult };
+  set_gtt_limit: { args: [gigabytes: number | null]; result: GpuMemoryResult };
 }
 
 export type BackendMethod = keyof BackendMethods;

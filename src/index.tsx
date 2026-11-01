@@ -1,11 +1,13 @@
 import { call as callBackend, definePlugin, toaster } from "@decky/api";
 import {
   ButtonItem,
+  ConfirmModal,
   DialogButton,
   Field,
   Focusable,
   PanelSection,
   PanelSectionRow,
+  showModal,
   SliderField,
   Spinner,
   staticClasses,
@@ -19,6 +21,7 @@ import {
   FaExclamationTriangle,
   FaLightbulb,
   FaLock,
+  FaMemory,
   FaMicrochip,
   FaRedo,
   FaShieldAlt,
@@ -36,6 +39,7 @@ import {
   CpuSettings,
   CpuStatusData,
   CuratedPreset,
+  CuUnlockData,
   FanCurve,
   FanCurvePreset,
   FanHwmonStatus,
@@ -47,6 +51,7 @@ import {
   FanUpdateResult,
   FanView,
   GovernorInfo,
+  GpuMemoryData,
   GpuSettings,
   GpuStatusData,
   LedSettingsData,
@@ -82,6 +87,42 @@ const FAN_QUIET_TEMPS = [50, 60, 65, 70, 75, 80, 85, 87];
 const FAN_QUIET_STOP = 45;
 const FULL_SPEED_ID = "full";
 const STOP_HANDLE = 0;
+const MIB = 1024 * 1024;
+const GIB = 1024 * MIB;
+const TOO_SMALL_VRAM = 256 * MIB;
+const CU_CHOICES: { target: number; label: string }[] = [
+  { target: 0, label: "Off" },
+  { target: 38, label: "38 CUs" },
+  { target: 40, label: "40 CUs" },
+];
+const CU_ARGUMENTS: Record<number, string> = {
+  38: "amdgpu.ps5_cu_unlock=3 amdgpu.disable_cu=0.0.0",
+  40: "amdgpu.ps5_cu_unlock=3",
+};
+const CU_UNLOCK_MODES: Record<number, string> = {
+  0: "Off",
+  1: "Probe only",
+  2: "First shader array only",
+  3: "All CUs",
+  4: "Probe only",
+};
+const CU_UNLOCK_ABOUT =
+  "Turns on the CUs disabled at the factory, which only happens at boot, so this edits cmdline.txt on your boot drive. Consoles have 36 or 38 active CUs out of 40. If games glitch, try RADV_DEBUG=nohiz, or turn this off.";
+const VRAM_CHOICES: { megabytes: number; label: string }[] = [
+  { megabytes: 512, label: "512 MB" },
+  { megabytes: 1024, label: "1 GB" },
+  { megabytes: 2048, label: "2 GB" },
+  { megabytes: 4096, label: "4 GB" },
+  { megabytes: 8192, label: "8 GB" },
+];
+const GTT_CHOICES: { gigabytes: number | null; label: string }[] = [
+  { gigabytes: null, label: "Default" },
+  { gigabytes: 10, label: "10 GB" },
+  { gigabytes: 12, label: "12 GB" },
+];
+const VRAM_ABOUT = "Memory reserved for the GPU all the time, taken from system RAM.";
+const GTT_ABOUT =
+  "How much system RAM the GPU can use on top of that. If a game runs out of memory, raise this first, because the RAM stays free when you aren't gaming.";
 
 const STYLES = `
 .ps5hw-grid {
@@ -267,6 +308,13 @@ const prettifyPreset = (id: string) =>
 
 const formatFreq = (mhz: number) =>
   mhz >= 1000 ? `${(mhz / 1000).toFixed(2)} GHz` : `${mhz} MHz`;
+
+const formatBytes = (size: number) => {
+  if (size >= GIB) {
+    return `${parseFloat((size / GIB).toFixed(2))} GB`;
+  }
+  return size >= MIB ? `${Math.floor(size / MIB)} MB` : `${size} bytes`;
+};
 
 const fanModeLabel = (mode: number | null) =>
   mode === null ? "Unknown" : FAN_MODE_LABELS[mode] ?? `Mode ${mode}`;
@@ -1447,6 +1495,245 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   );
 };
 
+const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const [state, setState] = useState<CuUnlockData | null>(null);
+  const [saving, setSaving] = useState<number | null>(null);
+  const alive = useRef<boolean>(true);
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const result = await call("get_cu_unlock");
+      if (!alive.current) {
+        return;
+      }
+      if (result.success) {
+        setState(result.data);
+      }
+      notify(result, true);
+    })();
+    return () => {
+      alive.current = false;
+    };
+  }, [call, notify]);
+
+  const save = async (target: number) => {
+    setSaving(target);
+    const result = await call("set_cu_unlock", target);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setState(result.data);
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  const choose = (target: number) => {
+    if (target === state?.configured_target) {
+      return;
+    }
+    if (target === 0) {
+      save(target);
+      return;
+    }
+    showModal(
+      <ConfirmModal
+        strTitle={`Unlock ${target} CUs`}
+        strDescription={`This adds ${CU_ARGUMENTS[target]} to cmdline.txt and takes effect after a reboot. Some of the disabled CUs can be faulty, which causes visual glitches. 38 CUs turns them all on and then masks one fixed pair, so it may not avoid a faulty one. If the screen is unusable after rebooting, remove the arguments from cmdline.txt over SSH or from another computer. The previous version is saved as cmdline.txt.bak.`}
+        strOKButtonText="Unlock"
+        bDestructiveWarning
+        onOK={() => save(target)}
+      />,
+    );
+  };
+
+  const running = state?.running ?? null;
+  const supported = running !== null;
+  const ready = supported && state?.cmdline_path != null;
+
+  let mode = running === null ? "" : CU_UNLOCK_MODES[running] ?? `Mode ${running}`;
+  if (state?.running_target === 38) {
+    mode = "38 CUs";
+  } else if (state?.running_mask) {
+    mode = `${mode}, masked ${state.running_mask}`;
+  }
+
+  let note = CU_UNLOCK_ABOUT;
+  if (state !== null && !supported) {
+    note = "This kernel doesn't include the CU unlock (amdgpu.ps5_cu_unlock).";
+  } else if (state !== null && !ready) {
+    note = `${state.boot_error} You can also add amdgpu.ps5_cu_unlock=3 to cmdline.txt by hand.`;
+  } else if (state?.pending) {
+    note = `${CU_UNLOCK_ABOUT} Reboot to apply your change.`;
+  }
+
+  return (
+    <PanelSection title="CU Unlock">
+      <PanelSectionRow>
+        <Field
+          label="Active CUs"
+          icon={<FaMicrochip />}
+          description={supported ? `Unlock this boot: ${mode}` : undefined}
+        >
+          {state === null ? <InlineSpinner /> : state.active_cus ?? "Unknown"}
+        </Field>
+      </PanelSectionRow>
+      <ButtonGrid columns={CU_CHOICES.length}>
+        {CU_CHOICES.map(({ target, label }) => (
+          <DialogButton
+            key={target}
+            className="ps5hw-btn"
+            disabled={!ready || saving !== null}
+            onClick={() => choose(target)}
+            style={{
+              borderBottom: `2px solid ${state?.configured_target === target ? ACCENT : "transparent"}`,
+            }}
+          >
+            {saving === target ? <InlineSpinner /> : label}
+          </DialogButton>
+        ))}
+      </ButtonGrid>
+      <PanelSectionRow>
+        <div className="ps5hw-note">{note}</div>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+};
+
+const vramDescription = (memory: GpuMemoryData) => {
+  const running = memory.vram_running;
+  const configured = memory.vram_configured;
+  if (!memory.boot_ready) {
+    return memory.boot_error ?? undefined;
+  }
+  if (configured < TOO_SMALL_VRAM) {
+    return `vram.txt asks for ${formatBytes(configured)}, which can cause a black screen. It's read as hex, so it was probably written in decimal. Pick a size below.`;
+  }
+  if (running !== null && Math.abs(running - configured) > configured / 16) {
+    return `${formatBytes(configured)} after a reboot`;
+  }
+  return undefined;
+};
+
+const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const [memory, setMemory] = useState<GpuMemoryData | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+  const alive = useRef<boolean>(true);
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const result = await call("get_gpu_memory");
+      if (!alive.current) {
+        return;
+      }
+      if (result.success) {
+        setMemory(result.data);
+      }
+      notify(result, true);
+    })();
+    return () => {
+      alive.current = false;
+    };
+  }, [call, notify]);
+
+  const save = async (id: string, request: () => ReturnType<typeof call<"set_vram">>) => {
+    setSaving(id);
+    const result = await request();
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setMemory(result.data);
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  const disabled = !memory?.boot_ready || saving !== null;
+  const pages = memory?.gtt_pages ?? null;
+
+  return (
+    <PanelSection title="GPU Memory">
+      <PanelSectionRow>
+        <Field label="VRAM" icon={<FaCube />} description={memory ? vramDescription(memory) : undefined}>
+          {memory === null ? (
+            <InlineSpinner />
+          ) : memory.vram_running !== null ? (
+            formatBytes(memory.vram_running)
+          ) : (
+            "Unknown"
+          )}
+        </Field>
+      </PanelSectionRow>
+      {chunk(VRAM_CHOICES, 2).map((row, rowIndex) => (
+        <ButtonGrid key={row[0].megabytes} columns={2}>
+          {row.map(({ megabytes, label }, index) => {
+            const id = `vram-${megabytes}`;
+            return (
+              <DialogButton
+                key={megabytes}
+                className={gridButtonClass(rowIndex * 2 + index, VRAM_CHOICES.length, 2)}
+                disabled={disabled}
+                onClick={() => save(id, () => call("set_vram", megabytes))}
+                style={{
+                  borderBottom: `2px solid ${memory?.vram_configured === megabytes * MIB ? ACCENT : "transparent"}`,
+                }}
+              >
+                {saving === id ? <InlineSpinner /> : label}
+              </DialogButton>
+            );
+          })}
+        </ButtonGrid>
+      ))}
+      <PanelSectionRow>
+        <div className="ps5hw-note">{VRAM_ABOUT}</div>
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <Field
+          label="GTT Limit"
+          icon={<FaMemory />}
+          description={memory?.boot_ready && memory.gtt_pending ? "Takes effect after a reboot" : undefined}
+        >
+          {memory === null ? (
+            <InlineSpinner />
+          ) : pages === null ? (
+            "Default"
+          ) : (
+            formatBytes(pages * 4096)
+          )}
+        </Field>
+      </PanelSectionRow>
+      <ButtonGrid columns={GTT_CHOICES.length}>
+        {GTT_CHOICES.map(({ gigabytes, label }) => {
+          const id = `gtt-${gigabytes}`;
+          const wanted = gigabytes === null ? null : (gigabytes * MIB) / 4;
+          return (
+            <DialogButton
+              key={id}
+              className="ps5hw-btn"
+              disabled={disabled}
+              onClick={() => save(id, () => call("set_gtt_limit", gigabytes))}
+              style={{
+                borderBottom: `2px solid ${memory !== null && pages === wanted ? ACCENT : "transparent"}`,
+              }}
+            >
+              {saving === id ? <InlineSpinner /> : label}
+            </DialogButton>
+          );
+        })}
+      </ButtonGrid>
+      <PanelSectionRow>
+        <div className="ps5hw-note">{GTT_ABOUT}</div>
+      </PanelSectionRow>
+    </PanelSection>
+  );
+};
+
 const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
   const [status, setStatus] = useState<GpuStatusData | null>(null);
@@ -1649,6 +1936,8 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           />
         </PanelSectionRow>
       </PanelSection>
+      <CuUnlockSection backend={backend} />
+      <GpuMemorySection backend={backend} />
     </>
   );
 };
