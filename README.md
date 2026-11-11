@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan curve or target temperature, live temperatures, CPU and GPU governors and clocks, and indicator LED presets, all from the Quick Access Menu.
+  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan curve or target temperature, live temperatures, CPU and GPU governors and clocks, GPU memory, zram and zswap, and indicator LED presets, all from the Quick Access Menu.
 </p>
 
 ---
@@ -106,10 +106,17 @@ With an EPP driver such as `amd-pstate-epp`, the kernel only offers Performance 
 - **Restore on Startup**: re-applies your last GPU governor and clock lock when Decky starts.
 
 - **CU Unlock**: turns on the compute units disabled at the factory (36 or 38 active out of 40). **40 CUs** adds `amdgpu.ps5_cu_unlock=3` to `cmdline.txt` on the boot drive, and **38 CUs** also adds `amdgpu.disable_cu=0.0.0` to mask one pair, so both need a reboot. **Off** removes both arguments, including a `disable_cu` you added yourself. The previous file is kept as `cmdline.txt.bak`. **Active CUs** shows the count the driver reported. Only an even split across both shader engines helps performance, so 38 CUs usually scores the same as 36. Some disabled CUs can be faulty, and the pair masked for 38 CUs is always the same one, so it may not avoid them. If you see glitches, try `RADV_DEBUG=nohiz`, then turn this off. If the screen is unusable, remove the arguments over SSH or from another computer.
-- **GPU Memory**: **VRAM** writes `vram.txt` on the boot drive, in the hex format the loader expects, and warns if the existing value looks wrong. It's a minimum that stays reserved from system RAM, so 512 MB suits most games. **GTT Limit** sets `ttm.pages_limit` in `cmdline.txt`, which raises how much system RAM the GPU can use without reserving it, so try this first if a game runs out of memory. Both need a reboot. See the [guide](https://rmuxnet.gitlab.io/ps5-linux-guide/guide/gpu#vram) for how the two interact.
-- **Boot partition**: CU Unlock and GPU Memory edit files on the FAT partition the console booted from, wherever the distro or desktop mounted it. If it isn't mounted, the plugin mounts it read-only at `/boot/efi` (or `/run/ps5-hwcon/boot` if that's taken), and only makes it writable while saving. It picks the partition whose `cmdline.txt` has the running `root=` argument. If it can't find one, or can't tell which one that is, the GPU tab shows why.
+- **Apply Now** (experimental): after changing CU Unlock, applies it without a reboot by stopping the display manager, reloading `amdgpu` with the new arguments and starting the display manager again. Steam and any running game close, while Decky keeps running in the background. If the new arguments fail to load, it falls back to the previous ones. It needs `amdgpu` built as a module, systemd and a display manager, and the tab says which one is missing. It runs as the transient unit `ps5-hwcon-cu-reload`, so check `journalctl -u ps5-hwcon-cu-reload` for what happened.
+- **Boot partition**: CU Unlock, GPU Memory and zswap edit files on the FAT partition the console booted from, wherever the distro or desktop mounted it. If it isn't mounted, the plugin mounts it read-only at `/boot/efi` (or `/run/ps5-hwcon/boot` if that's taken), and only makes it writable while saving. It picks the partition whose `cmdline.txt` has the running `root=` argument. If it can't find one, or can't tell which one that is, the GPU or Memory tab shows why.
 
 GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ`. The driver isn't part of [ps5-linux-patches](https://github.com/ps5-linux/ps5-linux-patches) itself, so on those kernels the GPU tab shows why it's unavailable and everything else works normally. While the CPU runs at a boost clock (3.3–3.5 GHz), the firmware takes over the GPU clock and holds it at the 2.23 GHz ceiling, regardless of the GPU governor or clock lock.
+
+### Memory
+
+- **Overview**: live RAM and swap usage, including each swap device, refreshed every 2 s.
+- **GPU Memory**: **VRAM** writes `vram.txt` on the boot drive, in the hex format the loader expects, and warns if the existing value looks wrong. It's a minimum that stays reserved from system RAM. 6 GB is the recommended choice for gaming. Pick 512 MB if you don't game, or set any size from 256 MB to 12 GB with **Custom Size**. **GTT Limit** sets `ttm.pages_limit` in `cmdline.txt`, which raises how much system RAM the GPU can use without reserving it, so try this if a game runs out of memory. Both need a reboot. See the [wiki](https://wiki.ps5-linux.eu/post-install/all-distros/#memory-and-swap) for how the two interact.
+- **zram**: turns compressed swap in RAM on or off and sets its size and compression, by writing `/etc/systemd/zram-generator.conf` (the previous file is kept as `.bak`). Needs `zram-generator` and a reboot. Turning it off writes a config without a device, which also masks a distro default.
+- **zswap**: switches zswap on or off immediately and saves `zswap.enabled` in `cmdline.txt`. It only helps with swap on a drive, so leave it off when using zram.
 
 ### LED
 

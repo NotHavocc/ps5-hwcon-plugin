@@ -169,6 +169,7 @@ export interface CuUnlockData {
   cmdline_path: string | null;
   boot_error: string | null;
   active_cus: number | null;
+  reload_blocker: string | null;
 }
 
 export interface GpuMemoryData {
@@ -178,6 +179,49 @@ export interface GpuMemoryData {
   vram_configured: number;
   gtt_pages: number | null;
   gtt_pending: boolean;
+}
+
+export interface SwapDevice {
+  name: string;
+  type: string;
+  size: number;
+  used: number;
+}
+
+export interface ZramRunning {
+  disksize: number;
+  algorithm: string | null;
+  original: number | null;
+  compressed: number | null;
+}
+
+export interface ZswapRunning {
+  enabled: boolean;
+  compressor: string | null;
+  max_pool_percent: number | null;
+}
+
+export interface MemoryStatusData {
+  ram_total: number | null;
+  ram_available: number | null;
+  swap_total: number | null;
+  swap_free: number | null;
+  swaps: SwapDevice[];
+  zram: ZramRunning | null;
+  zswap: ZswapRunning | null;
+}
+
+export interface SwapSettingsData {
+  zram_generator: boolean;
+  zram_source: string | null;
+  zram_error: string | null;
+  zram_enabled: boolean;
+  zram_size: string | null;
+  zram_algorithm: string | null;
+  zram_pending: boolean;
+  zswap_configured: boolean | null;
+  boot_ready: boolean;
+  boot_error: string | null;
 }
 
 export interface GovernorInfo {
@@ -199,6 +243,8 @@ export type GpuStatusResult = BackendResult<GpuStatusData>;
 export type GpuSettingsResult = BackendResult<GpuSettings>;
 export type CuUnlockResult = BackendResult<CuUnlockData>;
 export type GpuMemoryResult = BackendResult<GpuMemoryData>;
+export type MemoryStatusResult = BackendResult<MemoryStatusData>;
+export type SwapSettingsResult = BackendResult<SwapSettingsData>;
 
 export type FanSettingsArgs = [
   restore_on_boot: boolean | null,
@@ -240,14 +286,22 @@ export interface BackendMethods {
   set_gpu_settings: { args: [restore_on_boot: boolean]; result: GpuSettingsResult };
   get_cu_unlock: { args: []; result: CuUnlockResult };
   set_cu_unlock: { args: [target: number]; result: CuUnlockResult };
+  reload_cu_unlock: { args: []; result: BackendResult };
   get_gpu_memory: { args: []; result: GpuMemoryResult };
   set_vram: { args: [megabytes: number]; result: GpuMemoryResult };
   set_gtt_limit: { args: [gigabytes: number | null]; result: GpuMemoryResult };
+  get_memory_status: { args: []; result: MemoryStatusResult };
+  get_swap_settings: { args: []; result: SwapSettingsResult };
+  set_zram: {
+    args: [enabled: boolean, size: string | null, algorithm: string | null];
+    result: SwapSettingsResult;
+  };
+  set_zswap: { args: [enabled: boolean]; result: SwapSettingsResult };
 }
 
 export type BackendMethod = keyof BackendMethods;
 
-export type TabId = "fan" | "cpu" | "gpu" | "led";
+export type TabId = "fan" | "cpu" | "gpu" | "memory" | "led";
 
 export interface CuratedPreset {
   id: string;

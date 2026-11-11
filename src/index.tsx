@@ -17,8 +17,11 @@ import {
 import { FC, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   FaCheck,
+  FaCompressArrowsAlt,
   FaCube,
+  FaExchangeAlt,
   FaExclamationTriangle,
+  FaHdd,
   FaLightbulb,
   FaLock,
   FaMemory,
@@ -55,6 +58,8 @@ import {
   GpuSettings,
   GpuStatusData,
   LedSettingsData,
+  MemoryStatusData,
+  SwapSettingsData,
   TabId,
 } from "./types";
 
@@ -82,10 +87,12 @@ const FAN_CURVE_TEMP_MAX = 90;
 const FAN_PWM_MAX = 255;
 const FAN_MODE_FULL = 0;
 const FAN_MODE_CURVE = 2;
-const FAN_MODE_LABELS: Record<number, string> = { [FAN_MODE_FULL]: "Full Speed", 1: "Manual", [FAN_MODE_CURVE]: "Curve" };
+const FAN_MODE_FIRMWARE = 3;
+const FAN_MODE_LABELS: Record<number, string> = { [FAN_MODE_FULL]: "Full Speed", 1: "Manual", [FAN_MODE_CURVE]: "Curve", [FAN_MODE_FIRMWARE]: "Console Firmware" };
 const FAN_QUIET_TEMPS = [50, 60, 65, 70, 75, 80, 85, 87];
 const FAN_QUIET_STOP = 45;
 const FULL_SPEED_ID = "full";
+const FIRMWARE_ID = "firmware";
 const STOP_HANDLE = 0;
 const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
@@ -108,11 +115,21 @@ const CU_UNLOCK_MODES: Record<number, string> = {
 };
 const CU_UNLOCK_ABOUT =
   "Turns on the CUs disabled at the factory, which only happens at boot, so this edits cmdline.txt on your boot drive. Consoles have 36 or 38 active CUs out of 40. If games glitch, try RADV_DEBUG=nohiz, or turn this off.";
-const VRAM_CHOICES: { megabytes: number; label: string }[] = [
-  { megabytes: 512, label: "512 MB" },
+const CU_RELOAD_WARNING = [
+  "This applies the change now by reloading the GPU driver, but it's VERY experimental.",
+  "The display manager restarts, so Steam and any running game close. Save your progress first. Decky keeps running, so Thermal Guard and LED loops carry on.",
+  "If the screen stays black, restart the console. The change stays in cmdline.txt, so if the black screen comes back, remove it over SSH or from another computer.",
+];
+const RECOMMENDED_VRAM_MB = 6 * 1024;
+const CUSTOM_VRAM_MIN_MB = 256;
+const CUSTOM_VRAM_MAX_MB = 12 * 1024;
+const CUSTOM_VRAM_STEP_MB = 256;
+const VRAM_CHOICES: { megabytes: number; label: string; subtitle?: string }[] = [
+  { megabytes: 512, label: "512 MB", subtitle: "Loader default" },
   { megabytes: 1024, label: "1 GB" },
   { megabytes: 2048, label: "2 GB" },
   { megabytes: 4096, label: "4 GB" },
+  { megabytes: RECOMMENDED_VRAM_MB, label: "6 GB", subtitle: "Recommended" },
   { megabytes: 8192, label: "8 GB" },
 ];
 const GTT_CHOICES: { gigabytes: number | null; label: string }[] = [
@@ -120,9 +137,28 @@ const GTT_CHOICES: { gigabytes: number | null; label: string }[] = [
   { gigabytes: 10, label: "10 GB" },
   { gigabytes: 12, label: "12 GB" },
 ];
-const VRAM_ABOUT = "Memory reserved for the GPU all the time, taken from system RAM.";
+const ZRAM_SIZES: { id: string; label: string; subtitle: string }[] = [
+  { id: "ram / 4", label: "Quarter", subtitle: "ram / 4" },
+  { id: "ram / 2", label: "Half", subtitle: "ram / 2" },
+  { id: "ram", label: "All", subtitle: "ram" },
+];
+const ZRAM_ALGORITHMS: { id: string; label: string; subtitle?: string }[] = [
+  { id: "zstd", label: "zstd", subtitle: "Best ratio" },
+  { id: "lz4", label: "lz4", subtitle: "Fastest" },
+  { id: "lzo-rle", label: "lzo-rle" },
+];
+const DEFAULT_ZRAM_SIZE = "ram / 2";
+const DEFAULT_ZRAM_ALGORITHM = "zstd";
+const MEMORY_ABOUT =
+  "The CPU and GPU share one 16 GB pool, about 14 GB of it usable by Linux. Memory given to the GPU is taken from everything else.";
+const VRAM_ABOUT =
+  "Memory reserved for the GPU all the time, taken from system RAM. 6 GB is the usual choice for gaming. Needs a reboot.";
 const GTT_ABOUT =
-  "How much system RAM the GPU can use on top of that. If a game runs out of memory, raise this first, because the RAM stays free when you aren't gaming.";
+  "How much system RAM the GPU can use on top of that. If a game runs out of memory, raise this first, because the RAM stays free when you aren't gaming. Needs a reboot.";
+const ZRAM_ABOUT =
+  "A compressed swap device in RAM. It's fast and doesn't wear out a drive, but the compressed pages still use RAM. Saved in /etc/systemd/zram-generator.conf and applied after a reboot.";
+const ZSWAP_ABOUT =
+  "Compresses pages in RAM before they're written to a swap file or partition. It only helps with swap on a drive. With zram it compresses everything twice, so leave it off.";
 
 const STYLES = `
 .ps5hw-grid {
@@ -184,15 +220,26 @@ const STYLES = `
   opacity: 0.7;
   padding: 4px 0;
 }
-@container (max-width: 300px) {
-  .ps5hw-tabs > .ps5hw-btn .ps5hw-label {
-    flex-direction: column;
-    gap: 2px;
-  }
-  .ps5hw-tabs > .ps5hw-btn {
-    font-size: 12px;
-    padding: 6px 2px !important;
-  }
+.ps5hw-heading {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.6;
+  padding: 6px 0 0;
+}
+.ps5hw-lines > div {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ps5hw-tabs > .ps5hw-btn .ps5hw-label {
+  flex-direction: column;
+  gap: 3px;
+}
+.ps5hw-tabs > .ps5hw-btn {
+  font-size: 12px;
+  padding: 6px 2px !important;
 }
 @container (max-width: 240px) {
   .ps5hw-grid > .ps5hw-btn {
@@ -280,6 +327,7 @@ const TABS: { id: TabId; label: string; icon: JSX.Element }[] = [
   { id: "fan", label: "Fan", icon: <FaWind /> },
   { id: "cpu", label: "CPU", icon: <FaTachometerAlt /> },
   { id: "gpu", label: "GPU", icon: <FaCube /> },
+  { id: "memory", label: "RAM", icon: <FaMemory /> },
   { id: "led", label: "LED", icon: <FaLightbulb /> },
 ];
 
@@ -315,6 +363,9 @@ const formatBytes = (size: number) => {
   }
   return size >= MIB ? `${Math.floor(size / MIB)} MB` : `${size} bytes`;
 };
+
+const formatUsage = (size: number) =>
+  size >= GIB ? `${(size / GIB).toFixed(1)} GB` : `${Math.floor(size / MIB)} MB`;
 
 const fanModeLabel = (mode: number | null) =>
   mode === null ? "Unknown" : FAN_MODE_LABELS[mode] ?? `Mode ${mode}`;
@@ -917,6 +968,8 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
 
   const applyFullSpeed = () => runFanUpdate(FULL_SPEED_ID, () => call("set_fan_mode", FAN_MODE_FULL));
 
+  const applyFirmware = () => runFanUpdate(FIRMWARE_ID, () => call("set_fan_mode", FAN_MODE_FIRMWARE));
+
   const editCurve = (curve: FanCurve) => {
     curveTouched.current = true;
     setCurveDraft(curve);
@@ -972,7 +1025,20 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const protectionEnabled = guardEnabled || alarmEnabled;
   const curveMode = status?.interface === "curve";
   const fan = curveMode ? status?.fan ?? null : null;
-  const fullSpeed = fan?.mode === FAN_MODE_FULL;
+  const curveOverridden = fan !== null && fan.mode !== FAN_MODE_CURVE;
+
+  const firmwareButton = curveMode && (
+    <PanelSectionRow>
+      <ButtonItem
+        layout="below"
+        description="Hands the fan back to the console's own fan table."
+        disabled={busy || fan === null || fan.mode === FAN_MODE_FIRMWARE}
+        onClick={applyFirmware}
+      >
+        <ButtonLabel icon={<FaUndo />} label="Return to Console Firmware" busy={applying === FIRMWARE_ID} />
+      </ButtonItem>
+    </PanelSectionRow>
+  );
 
   let activeView: FanView = "target";
   if (curveMode) {
@@ -1109,14 +1175,14 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
             {curveMode && (
               <PanelSectionRow>
                 <Field label="Fan Target" icon={<FaWind />}>
-                  {fullSpeed ? "Full speed" : targetValue}
+                  {curveOverridden ? fanModeLabel(fan.mode) : targetValue}
                 </Field>
               </PanelSectionRow>
             )}
             {chunk(FAN_PRESETS, 2).map((row, rowIndex) => (
               <ButtonGrid key={row.map((p) => p.id).join("|")} columns={2}>
                 {row.map((preset, index) => {
-                  const selected = target === preset.temp && !fullSpeed;
+                  const selected = target === preset.temp && !curveOverridden;
                   return (
                     <DialogButton
                       key={preset.id}
@@ -1138,6 +1204,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 })}
               </ButtonGrid>
             ))}
+            {firmwareButton}
           </PanelSection>
           <PanelSection title="Manual Target">
             <PanelSectionRow>
@@ -1166,7 +1233,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
             <PanelSectionRow>
               <ButtonItem
                 layout="below"
-                disabled={busy || loading || (slider === target && !fullSpeed)}
+                disabled={busy || loading || (slider === target && !curveOverridden)}
                 onClick={() => applyTarget("manual", slider)}
               >
                 <ButtonLabel icon={<FaWind />} label="Apply Target" busy={applying === "manual"} />
@@ -1202,6 +1269,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 </DialogButton>
               ))}
             </ButtonGrid>
+            {firmwareButton}
           </PanelSection>
           <PanelSection title="Fan Curve">
             {fan !== null && curveDraft !== null ? (
@@ -1498,7 +1566,7 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
 const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
   const [state, setState] = useState<CuUnlockData | null>(null);
-  const [saving, setSaving] = useState<number | null>(null);
+  const [saving, setSaving] = useState<number | "reload" | null>(null);
   const alive = useRef<boolean>(true);
 
   useEffect(() => {
@@ -1550,6 +1618,33 @@ const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backe
     );
   };
 
+  const reload = async () => {
+    setSaving("reload");
+    const result = await call("reload_cu_unlock");
+    if (!alive.current) {
+      return;
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  const confirmReload = () =>
+    showModal(
+      <ConfirmModal
+        strTitle="Reload GPU Driver"
+        strDescription={
+          <>
+            {CU_RELOAD_WARNING.map((paragraph) => (
+              <p key={paragraph}>{paragraph}</p>
+            ))}
+          </>
+        }
+        strOKButtonText="Reload Now"
+        bDestructiveWarning
+        onOK={reload}
+      />,
+    );
+
   const running = state?.running ?? null;
   const supported = running !== null;
   const ready = supported && state?.cmdline_path != null;
@@ -1569,6 +1664,8 @@ const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backe
   } else if (state?.pending) {
     note = `${CU_UNLOCK_ABOUT} Reboot to apply your change.`;
   }
+  const canReload = ready && state?.pending === true;
+  const blocker = state?.reload_blocker ?? null;
 
   return (
     <PanelSection title="CU Unlock">
@@ -1599,6 +1696,23 @@ const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backe
       <PanelSectionRow>
         <div className="ps5hw-note">{note}</div>
       </PanelSectionRow>
+      {canReload && blocker !== null && (
+        <PanelSectionRow>
+          <div className="ps5hw-note">{blocker}</div>
+        </PanelSectionRow>
+      )}
+      {canReload && blocker === null && (
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            description="Or apply it now by reloading the GPU driver (experimental)."
+            disabled={saving !== null}
+            onClick={confirmReload}
+          >
+            <ButtonLabel icon={<FaSyncAlt />} label="Apply Now" busy={saving === "reload"} />
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
     </PanelSection>
   );
 };
@@ -1618,10 +1732,39 @@ const vramDescription = (memory: GpuMemoryData) => {
   return undefined;
 };
 
+const choiceStyle = (selected: boolean) => ({
+  borderBottom: `2px solid ${selected ? ACCENT : "transparent"}`,
+});
+
+const ChoiceLabel: FC<{ label: string; subtitle?: string; busy?: boolean }> = ({ label, subtitle, busy }) => {
+  if (busy) {
+    return <InlineSpinner />;
+  }
+  if (!subtitle) {
+    return <>{label}</>;
+  }
+  return (
+    <div className="ps5hw-stack">
+      <span>{label}</span>
+      <span className="ps5hw-sub">{subtitle}</span>
+    </div>
+  );
+};
+
+const customVramStart = (configured: number | null) => {
+  const megabytes = configured === null ? RECOMMENDED_VRAM_MB : Math.round(configured / MIB);
+  if (megabytes < CUSTOM_VRAM_MIN_MB || megabytes > CUSTOM_VRAM_MAX_MB) {
+    return RECOMMENDED_VRAM_MB;
+  }
+  return Math.round(megabytes / CUSTOM_VRAM_STEP_MB) * CUSTOM_VRAM_STEP_MB;
+};
+
 const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
   const [memory, setMemory] = useState<GpuMemoryData | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
+  const [custom, setCustom] = useState<number>(RECOMMENDED_VRAM_MB);
+  const customTouched = useRef<boolean>(false);
   const alive = useRef<boolean>(true);
 
   useEffect(() => {
@@ -1641,6 +1784,12 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
     };
   }, [call, notify]);
 
+  useEffect(() => {
+    if (!customTouched.current && memory !== null) {
+      setCustom(customVramStart(memory.vram_configured));
+    }
+  }, [memory?.vram_configured]);
+
   const save = async (id: string, request: () => ReturnType<typeof call<"set_vram">>) => {
     setSaving(id);
     const result = await request();
@@ -1649,12 +1798,14 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
     }
     if (result.success) {
       setMemory(result.data);
+      customTouched.current = false;
     }
     notify(result);
     setSaving(null);
   };
 
   const disabled = !memory?.boot_ready || saving !== null;
+  const configured = memory?.vram_configured ?? null;
   const pages = memory?.gtt_pages ?? null;
 
   return (
@@ -1670,26 +1821,59 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
           )}
         </Field>
       </PanelSectionRow>
-      {chunk(VRAM_CHOICES, 2).map((row, rowIndex) => (
-        <ButtonGrid key={row[0].megabytes} columns={2}>
-          {row.map(({ megabytes, label }, index) => {
+      {chunk(VRAM_CHOICES, 3).map((row) => (
+        <ButtonGrid key={row[0].megabytes} columns={3}>
+          {row.map(({ megabytes, label, subtitle }) => {
             const id = `vram-${megabytes}`;
             return (
               <DialogButton
                 key={megabytes}
-                className={gridButtonClass(rowIndex * 2 + index, VRAM_CHOICES.length, 2)}
+                className="ps5hw-btn"
                 disabled={disabled}
                 onClick={() => save(id, () => call("set_vram", megabytes))}
-                style={{
-                  borderBottom: `2px solid ${memory?.vram_configured === megabytes * MIB ? ACCENT : "transparent"}`,
-                }}
+                style={choiceStyle(configured === megabytes * MIB)}
               >
-                {saving === id ? <InlineSpinner /> : label}
+                <ChoiceLabel label={label} subtitle={subtitle} busy={saving === id} />
               </DialogButton>
             );
           })}
         </ButtonGrid>
       ))}
+      <PanelSectionRow>
+        <SliderField
+          label="Custom Size"
+          value={custom}
+          min={CUSTOM_VRAM_MIN_MB}
+          max={CUSTOM_VRAM_MAX_MB}
+          step={CUSTOM_VRAM_STEP_MB}
+          showValue
+          valueSuffix=" MB"
+          resetValue={RECOMMENDED_VRAM_MB}
+          notchCount={2}
+          notchLabels={[
+            { notchIndex: 0, label: formatBytes(CUSTOM_VRAM_MIN_MB * MIB), value: CUSTOM_VRAM_MIN_MB },
+            { notchIndex: 1, label: formatBytes(CUSTOM_VRAM_MAX_MB * MIB), value: CUSTOM_VRAM_MAX_MB },
+          ]}
+          disabled={disabled}
+          onChange={(value) => {
+            customTouched.current = true;
+            setCustom(value);
+          }}
+        />
+      </PanelSectionRow>
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          disabled={disabled || custom * MIB === configured}
+          onClick={() => save("vram-custom", () => call("set_vram", custom))}
+        >
+          <ButtonLabel
+            icon={<FaCube />}
+            label={`Set VRAM to ${formatBytes(custom * MIB)}`}
+            busy={saving === "vram-custom"}
+          />
+        </ButtonItem>
+      </PanelSectionRow>
       <PanelSectionRow>
         <div className="ps5hw-note">{VRAM_ABOUT}</div>
       </PanelSectionRow>
@@ -1718,11 +1902,9 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
               className="ps5hw-btn"
               disabled={disabled}
               onClick={() => save(id, () => call("set_gtt_limit", gigabytes))}
-              style={{
-                borderBottom: `2px solid ${memory !== null && pages === wanted ? ACCENT : "transparent"}`,
-              }}
+              style={choiceStyle(memory !== null && pages === wanted)}
             >
-              {saving === id ? <InlineSpinner /> : label}
+              <ChoiceLabel label={label} busy={saving === id} />
             </DialogButton>
           );
         })}
@@ -1731,6 +1913,294 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
         <div className="ps5hw-note">{GTT_ABOUT}</div>
       </PanelSectionRow>
     </PanelSection>
+  );
+};
+
+type SwapSaving =
+  | { kind: "zram"; enabled: boolean; size: string; algorithm: string }
+  | { kind: "zswap"; enabled: boolean };
+
+const zramDescription = (status: MemoryStatusData | null, swap: SwapSettingsData | null) => {
+  const running = status?.zram ?? null;
+  const parts: string[] = [];
+  if (running) {
+    parts.push(running.algorithm ?? "Unknown compression");
+    if (running.original !== null && running.compressed !== null) {
+      parts.push(`${formatUsage(running.original)} stored in ${formatUsage(running.compressed)}`);
+    }
+  }
+  if (swap?.zram_pending) {
+    parts.push("Your change takes effect after a reboot");
+  }
+  return parts.join(" · ") || undefined;
+};
+
+const zramNotes = (swap: SwapSettingsData | null) => {
+  const notes: string[] = [];
+  if (swap === null) {
+    return notes;
+  }
+  if (swap.zram_error) {
+    notes.push(swap.zram_error);
+  } else if (!swap.zram_generator) {
+    notes.push("zram-generator isn't installed. Install it with your package manager to turn zram on here.");
+  }
+  if (swap.zram_enabled && !ZRAM_SIZES.some(({ id }) => id === swap.zram_size)) {
+    notes.push(`Configured size: ${swap.zram_size ?? "zram-generator default"}.`);
+  }
+  if (swap.zram_source && /^\/(usr|lib)\//.test(swap.zram_source)) {
+    notes.push(`Using your distro's default from ${swap.zram_source}.`);
+  }
+  return notes;
+};
+
+const zswapDescription = (status: MemoryStatusData, swap: SwapSettingsData | null) => {
+  const zswap = status.zswap;
+  if (zswap === null) {
+    return "This kernel doesn't include zswap.";
+  }
+  const parts: string[] = [];
+  if (zswap.compressor) {
+    parts.push(zswap.compressor);
+  }
+  if (zswap.max_pool_percent !== null) {
+    parts.push(`up to ${zswap.max_pool_percent}% of RAM`);
+  }
+  const configured = swap?.zswap_configured ?? null;
+  if (swap && !swap.boot_ready) {
+    parts.push("Changes last until reboot: the boot partition wasn't found");
+  } else if (configured !== null && configured !== zswap.enabled) {
+    parts.push(`${configured ? "On" : "Off"} after a reboot`);
+  }
+  if (zswap.enabled && status.zram) {
+    parts.push("zram is also on, so pages are compressed twice");
+  }
+  return parts.join(" · ") || undefined;
+};
+
+const MemoryTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const [status, setStatus] = useState<MemoryStatusData | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
+  const [swap, setSwap] = useState<SwapSettingsData | null>(null);
+  const [saving, setSaving] = useState<SwapSaving | null>(null);
+  const alive = useRef<boolean>(true);
+  const polling = useRef<boolean>(false);
+
+  const refreshStatus = useCallback(async () => {
+    if (polling.current) {
+      return null;
+    }
+    polling.current = true;
+    const result = await call("get_memory_status");
+    polling.current = false;
+    if (!alive.current) {
+      return null;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setStatusError(null);
+    } else {
+      setStatusError(result.error);
+    }
+    return result;
+  }, [call]);
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const [statusResult, swapResult] = await Promise.all([refreshStatus(), call("get_swap_settings")]);
+      if (!alive.current) {
+        return;
+      }
+      if (statusResult) {
+        notify(statusResult, true);
+      }
+      if (swapResult.success) {
+        setSwap(swapResult.data);
+      }
+      notify(swapResult, true);
+    })();
+    const timer = window.setInterval(refreshStatus, STATUS_POLL_MS);
+    return () => {
+      alive.current = false;
+      window.clearInterval(timer);
+    };
+  }, [refreshStatus, call, notify]);
+
+  const finishSwap = async (request: Promise<BackendResult<SwapSettingsData>>) => {
+    const result = await request;
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setSwap(result.data);
+    }
+    notify(result);
+    setSaving(null);
+    refreshStatus();
+  };
+
+  const saveZram = (change: { enabled?: boolean; size?: string; algorithm?: string }) => {
+    if (swap === null) {
+      return;
+    }
+    const enabled = change.enabled ?? true;
+    const currentSize = ZRAM_SIZES.some(({ id }) => id === swap.zram_size) ? swap.zram_size : null;
+    const currentAlgorithm = ZRAM_ALGORITHMS.some(({ id }) => id === swap.zram_algorithm) ? swap.zram_algorithm : null;
+    const size = change.size ?? currentSize ?? DEFAULT_ZRAM_SIZE;
+    const algorithm = change.algorithm ?? currentAlgorithm ?? DEFAULT_ZRAM_ALGORITHM;
+    setSaving({ kind: "zram", enabled, size, algorithm });
+    finishSwap(call("set_zram", enabled, size, algorithm));
+  };
+
+  const saveZswap = (enabled: boolean) => {
+    setSaving({ kind: "zswap", enabled });
+    finishSwap(call("set_zswap", enabled));
+  };
+
+  let ramValue: ReactNode = <InlineSpinner />;
+  let ramDescription: string | undefined = statusError ?? undefined;
+  let swapValue: ReactNode = statusError ? "Unknown" : <InlineSpinner />;
+  let swapDescription: ReactNode;
+  if (status !== null) {
+    const { ram_total: total, ram_available: available } = status;
+    if (total && available !== null) {
+      ramValue = `${formatUsage(total - available)} of ${formatUsage(total)}`;
+      ramDescription = `${formatUsage(available)} available`;
+    } else {
+      ramValue = "Unknown";
+    }
+    if (status.swaps.length === 0) {
+      swapValue = "None";
+      swapDescription = "No swap is active.";
+    } else {
+      const swapTotal = status.swap_total || status.swaps.reduce((sum, device) => sum + device.size, 0);
+      const used =
+        status.swap_free !== null
+          ? swapTotal - status.swap_free
+          : status.swaps.reduce((sum, device) => sum + device.used, 0);
+      swapValue = `${formatUsage(used)} of ${formatUsage(swapTotal)}`;
+      swapDescription = (
+        <div className="ps5hw-lines">
+          {status.swaps.map((device) => (
+            <div key={device.name}>
+              {device.name} ({device.name.includes("zram") ? "zram" : device.type}): {formatUsage(device.used)} of{" "}
+              {formatUsage(device.size)}
+            </div>
+          ))}
+        </div>
+      );
+    }
+  } else if (statusError) {
+    ramValue = "Unknown";
+  }
+
+  const zramSaving = saving?.kind === "zram" ? saving : null;
+  const zramConfigured = swap?.zram_enabled ?? false;
+  const zramOptions = zramConfigured && saving === null;
+  const notes = zramNotes(swap);
+  const zramRunning = status?.zram ?? null;
+
+  const zswap = status?.zswap ?? null;
+  const zswapChecked = saving?.kind === "zswap" ? saving.enabled : zswap?.enabled ?? false;
+
+  return (
+    <>
+      <PanelSection title="Overview">
+        <PanelSectionRow>
+          <Field label="RAM" icon={<FaMemory />} description={ramDescription}>
+            {ramValue}
+          </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <Field label="Swap" icon={<FaExchangeAlt />} description={swapDescription}>
+            {swapValue}
+          </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div className="ps5hw-note">{MEMORY_ABOUT}</div>
+        </PanelSectionRow>
+      </PanelSection>
+      <GpuMemorySection backend={backend} />
+      <PanelSection title="zram">
+        <PanelSectionRow>
+          <Field label="zram" icon={<FaCompressArrowsAlt />} description={zramDescription(status, swap)}>
+            {zramRunning ? formatUsage(zramRunning.disksize) : status === null ? <InlineSpinner /> : "Off"}
+          </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ToggleField
+            label="Enable zram"
+            description={ZRAM_ABOUT}
+            checked={zramSaving ? zramSaving.enabled : zramConfigured}
+            disabled={swap === null || saving !== null}
+            onChange={(checked) => saveZram({ enabled: checked })}
+          />
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <div className="ps5hw-heading">Size</div>
+        </PanelSectionRow>
+        <ButtonGrid columns={ZRAM_SIZES.length}>
+          {ZRAM_SIZES.map(({ id, label, subtitle }) => (
+            <DialogButton
+              key={id}
+              className="ps5hw-btn"
+              disabled={!zramOptions}
+              onClick={() => saveZram({ size: id })}
+              style={choiceStyle(zramConfigured && swap?.zram_size === id)}
+            >
+              <ChoiceLabel label={label} subtitle={subtitle} busy={zramSaving?.enabled === true && zramSaving.size === id} />
+            </DialogButton>
+          ))}
+        </ButtonGrid>
+        <PanelSectionRow>
+          <div className="ps5hw-heading">Compression</div>
+        </PanelSectionRow>
+        <ButtonGrid columns={ZRAM_ALGORITHMS.length}>
+          {ZRAM_ALGORITHMS.map(({ id, label, subtitle }) => (
+            <DialogButton
+              key={id}
+              className="ps5hw-btn"
+              disabled={!zramOptions}
+              onClick={() => saveZram({ algorithm: id })}
+              style={choiceStyle(zramConfigured && swap?.zram_algorithm === id)}
+            >
+              <ChoiceLabel
+                label={label}
+                subtitle={subtitle}
+                busy={zramSaving?.enabled === true && zramSaving.algorithm === id}
+              />
+            </DialogButton>
+          ))}
+        </ButtonGrid>
+        {notes.length > 0 && (
+          <PanelSectionRow>
+            <div className="ps5hw-note">{notes.join(" ")}</div>
+          </PanelSectionRow>
+        )}
+      </PanelSection>
+      <PanelSection title="zswap">
+        <PanelSectionRow>
+          <Field
+            label="zswap"
+            icon={<FaHdd />}
+            description={status !== null ? zswapDescription(status, swap) : undefined}
+          >
+            {status === null ? <InlineSpinner /> : zswap === null ? "Unavailable" : zswap.enabled ? "On" : "Off"}
+          </Field>
+        </PanelSectionRow>
+        <PanelSectionRow>
+          <ToggleField
+            label="Enable zswap"
+            description={ZSWAP_ABOUT}
+            checked={zswapChecked}
+            disabled={zswap === null || saving !== null}
+            onChange={saveZswap}
+          />
+        </PanelSectionRow>
+      </PanelSection>
+    </>
   );
 };
 
@@ -1937,7 +2407,6 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSectionRow>
       </PanelSection>
       <CuUnlockSection backend={backend} />
-      <GpuMemorySection backend={backend} />
     </>
   );
 };
@@ -2201,6 +2670,7 @@ const Content: FC = () => {
       {tab === "fan" && <FanTab backend={backend} />}
       {tab === "cpu" && <CpuTab backend={backend} />}
       {tab === "gpu" && <GpuTab backend={backend} />}
+      {tab === "memory" && <MemoryTab backend={backend} />}
       {tab === "led" && <LedTab backend={backend} />}
     </>
   );

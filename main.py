@@ -1,7 +1,9 @@
 import asyncio
+import configparser
 import errno
 import glob
 import gzip
+import io
 import json
 import os
 import re
@@ -41,6 +43,7 @@ FAN_PWM_MAX = 255
 FAN_MODE_FULL = 0
 FAN_MODE_MANUAL = 1
 FAN_MODE_CURVE = 2
+FAN_MODE_FIRMWARE = 3
 
 FAN_TARGET_CURVE_OFFSETS = (-12, -8, -5, -2, 0, 2, 4, 6)
 FAN_TARGET_CURVE_PERCENT = (10, 15, 22, 32, 45, 60, 80, 100)
@@ -114,10 +117,68 @@ BOOT_CMDLINE_MAX = 2047
 RUNNING_CMDLINE_PATH = "/proc/cmdline"
 VRAM_TOTAL_GLOB = "/sys/class/drm/card[0-9]*/device/mem_info_vram_total"
 VRAM_DEFAULT_BYTES = 512 * 1024 * 1024
-VRAM_CHOICES_MB = (512, 1024, 2048, 4096, 8192)
+VRAM_MIN_MB = 256
+VRAM_MAX_MB = 12 * 1024
 GTT_CHOICES_GB = (10, 12)
 GTT_ARG = "ttm.pages_limit"
 GTT_PATTERN = re.compile(r"(?:^|\s+)ttm\.pages[-_]limit=(\S*)")
+GPU_HIDDEN_GOVERNORS = ("passive",)
+MEMINFO_PATH = "/proc/meminfo"
+SWAPS_PATH = "/proc/swaps"
+PROC_STAT_PATH = "/proc/stat"
+ZRAM_DEVICE = "zram0"
+ZRAM_BLOCK_DIR = f"/sys/block/{ZRAM_DEVICE}"
+ZRAM_CONFIG_PATH = "/etc/systemd/zram-generator.conf"
+ZRAM_VENDOR_CONFIG_PATHS = (
+    "/usr/lib/systemd/zram-generator.conf",
+    "/lib/systemd/zram-generator.conf",
+)
+ZRAM_GENERATOR_PATHS = (
+    "/usr/lib/systemd/system-generators/zram-generator",
+    "/lib/systemd/system-generators/zram-generator",
+)
+ZRAM_SIZES = ("ram / 4", "ram / 2", "ram")
+ZRAM_ALGORITHMS = ("zstd", "lz4", "lzo-rle")
+ZRAM_DISABLED_CONFIG = (
+    "# Written by PS5 Hardware Control: zram is off. This file masks any distro default.\n"
+)
+ZSWAP_DIR = "/sys/module/zswap/parameters"
+ZSWAP_ENABLED_PATH = f"{ZSWAP_DIR}/enabled"
+ZSWAP_ARG = "zswap.enabled"
+ZSWAP_PATTERN = re.compile(r"(?:^|\s+)zswap\.enabled=(\S*)")
+AMDGPU_REFCNT_PATH = "/sys/module/amdgpu/refcnt"
+DISPLAY_MANAGER_PATH = "/etc/systemd/system/display-manager.service"
+CU_RELOAD_UNIT = "ps5-hwcon-cu-reload"
+
+CU_RELOAD_SCRIPT = """
+value="$1"
+mask="$2"
+previous="$3"
+previous_mask="$4"
+set_consoles() {
+  for console in /sys/class/vtconsole/vtcon*; do
+    if grep -q 'frame buffer' "$console/name" 2>/dev/null; then
+      echo "$1" >"$console/bind" 2>/dev/null
+    fi
+  done
+}
+sleep 2
+systemctl stop display-manager.service
+sleep 2
+set_consoles 0
+if timeout 60 modprobe -r amdgpu; then
+  if timeout 120 modprobe amdgpu ps5_cu_unlock="$value" disable_cu="$mask"; then
+    echo "amdgpu reloaded with ps5_cu_unlock=$value disable_cu=$mask"
+  else
+    echo "amdgpu failed to load with ps5_cu_unlock=$value disable_cu=$mask, trying $previous"
+    timeout 120 modprobe amdgpu ps5_cu_unlock="$previous" disable_cu="$previous_mask"
+  fi
+else
+  echo "amdgpu could not be unloaded, it is probably still in use"
+fi
+set_consoles 1
+systemctl start display-manager.service
+"""
 GPU_HIDDEN_GOVERNORS = ("passive",)
 
 BUZZER_DIR = "/sys/class/misc/ps5_buzzer"
@@ -1316,8 +1377,7 @@ def _fat_mounts():
         return mounts
     for row in rows:
         if len(row) >= 3 and row[2] in BOOT_FILESYSTEMS:
-            mount = re.sub(r"\\(\d{3})", lambda code: chr(int(code.group(1), 8)), row[1])
-            mounts.append(mount)
+            mounts.append(_unescape_octal(row[1]))
     return mounts
 
 def _boot_mount():
@@ -1529,12 +1589,222 @@ def _read_gpu_memory_sync():
     }
 
 
+def _format_megabytes(megabytes):
+    return f"{megabytes / 1024:g} GB" if megabytes >= 1024 else f"{megabytes} MB"
+
+
+def _unescape_octal(text):
+    return re.sub(r"\\(\d{3})", lambda code: chr(int(code.group(1), 8)), text)
+
+
+def _kernel_bool(value):
+    return value.strip().lower() in ("1", "y", "yes", "on", "true")
+
+
+def _read_meminfo():
+    values = {}
+    with open(MEMINFO_PATH, encoding="ascii", errors="replace") as handle:
+        for line in handle:
+            key, _, rest = line.partition(":")
+            fields = rest.split()
+            if fields and fields[0].isdigit():
+                values[key] = int(fields[0]) * 1024
+    return values
+
+
+def _read_swaps():
+    with open(SWAPS_PATH, encoding="utf-8", errors="replace") as handle:
+        rows = [row.split() for row in handle.read().splitlines()[1:]]
+    return [
+        {
+            "name": _unescape_octal(row[0]),
+            "type": row[1],
+            "size": int(row[2]) * 1024,
+            "used": int(row[3]) * 1024,
+        }
+        for row in rows
+        if len(row) >= 4 and row[2].isdigit() and row[3].isdigit()
+    ]
+
+
+def _read_zram_running():
+    if not os.path.isdir(ZRAM_BLOCK_DIR):
+        return None
+    algorithms = _read_sysfs(f"{ZRAM_BLOCK_DIR}/comp_algorithm").split()
+    selected = next((name.strip("[]") for name in algorithms if name.startswith("[")), None)
+    stats = _read_sysfs(f"{ZRAM_BLOCK_DIR}/mm_stat").split()
+    return {
+        "disksize": _coerce_int(_read_sysfs(f"{ZRAM_BLOCK_DIR}/disksize")) or 0,
+        "algorithm": selected,
+        "original": _coerce_int(stats[0]) if stats else None,
+        "compressed": _coerce_int(stats[1]) if len(stats) > 1 else None,
+    }
+
+
+def _read_zswap_running():
+    if not os.path.isdir(ZSWAP_DIR):
+        return None
+
+    def parameter(name):
+        try:
+            return _read_sysfs(f"{ZSWAP_DIR}/{name}")
+        except OSError:
+            return None
+
+    return {
+        "enabled": _kernel_bool(parameter("enabled") or ""),
+        "compressor": parameter("compressor"),
+        "max_pool_percent": _coerce_int(parameter("max_pool_percent") or ""),
+    }
+
+
+def _zram_swap_active(swaps):
+    return any(os.path.basename(swap["name"]) == ZRAM_DEVICE for swap in swaps)
+
+
+def _read_memory_status_sync():
+    meminfo = _read_meminfo()
+    swaps = _read_swaps()
+    return {
+        "ram_total": meminfo.get("MemTotal"),
+        "ram_available": meminfo.get("MemAvailable"),
+        "swap_total": meminfo.get("SwapTotal"),
+        "swap_free": meminfo.get("SwapFree"),
+        "swaps": swaps,
+        "zram": _read_zram_running() if _zram_swap_active(swaps) else None,
+        "zswap": _read_zswap_running(),
+    }
+
+
+def _changed_since_boot(path):
+    try:
+        with open(PROC_STAT_PATH, encoding="ascii", errors="replace") as handle:
+            booted = next(int(line.split()[1]) for line in handle if line.startswith("btime "))
+        return os.path.getmtime(path) > booted
+    except (OSError, StopIteration, ValueError, IndexError):
+        return False
+
+
+def _zram_vendor_config():
+    return next((path for path in ZRAM_VENDOR_CONFIG_PATHS if os.path.isfile(path)), None)
+
+
+def _load_zram_config(path):
+    parser = configparser.ConfigParser(interpolation=None)
+    if path is not None:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            parser.read_string(handle.read(), source=path)
+    return parser
+
+
+def _read_swap_settings_sync():
+    source = ZRAM_CONFIG_PATH if os.path.isfile(ZRAM_CONFIG_PATH) else _zram_vendor_config()
+    zram_error = None
+    try:
+        config = _load_zram_config(source)
+    except configparser.Error as exc:
+        config = configparser.ConfigParser(interpolation=None)
+        zram_error = f"{source} couldn't be parsed: {exc}"
+    section = config[ZRAM_DEVICE] if config.has_section(ZRAM_DEVICE) else None
+    algorithm = section.get("compression-algorithm") if section else None
+    swaps = _read_swaps()
+    running = _read_zram_running() if _zram_swap_active(swaps) else None
+
+    cmdline_path = _boot_file("cmdline.txt")
+    zswap_configured = None
+    if cmdline_path is not None:
+        values = ZSWAP_PATTERN.findall(_split_cmdline(_read_cmdline_sync(cmdline_path))[0])
+        zswap_configured = _kernel_bool(values[-1]) if values else None
+    configured_algorithm = algorithm.split()[0] if algorithm else None
+    return {
+        "zram_generator": any(os.path.isfile(path) for path in ZRAM_GENERATOR_PATHS),
+        "zram_source": source,
+        "zram_error": zram_error,
+        "zram_enabled": section is not None,
+        "zram_size": section.get("zram-size") if section else None,
+        "zram_algorithm": configured_algorithm,
+        "zram_pending": (section is not None) != (running is not None)
+        or (source == ZRAM_CONFIG_PATH and _changed_since_boot(source))
+        or bool(
+            running
+            and configured_algorithm
+            and running["algorithm"]
+            and configured_algorithm != running["algorithm"]
+        ),
+        "zswap_configured": zswap_configured,
+        "boot_ready": cmdline_path is not None,
+        "boot_error": None if cmdline_path else _boot_missing(),
+    }
+
+
+def _write_zram_config_sync(enabled, size, algorithm):
+    original = None
+    if os.path.isfile(ZRAM_CONFIG_PATH):
+        with open(ZRAM_CONFIG_PATH, "rb") as handle:
+            original = handle.read()
+    if enabled:
+        config = _load_zram_config(ZRAM_CONFIG_PATH if original else _zram_vendor_config())
+        if not config.has_section(ZRAM_DEVICE):
+            config.add_section(ZRAM_DEVICE)
+        config[ZRAM_DEVICE]["zram-size"] = size
+        config[ZRAM_DEVICE]["compression-algorithm"] = algorithm
+        buffer = io.StringIO()
+        buffer.write("# Written by PS5 Hardware Control\n")
+        config.write(buffer)
+        data = buffer.getvalue()
+    else:
+        data = ZRAM_DISABLED_CONFIG
+    if data.encode("utf-8") == original:
+        return
+    os.makedirs(os.path.dirname(ZRAM_CONFIG_PATH), exist_ok=True)
+    _replace_file_sync(ZRAM_CONFIG_PATH, data.encode("utf-8"), original)
+
+
 def _read_active_cus():
     result = _run_command("dmesg")
     if result is None:
         return None
     counts = ACTIVE_CU_PATTERN.findall(result.stdout)
     return int(counts[-1]) if counts else None
+
+
+def _cu_reload_blocker():
+    if hasattr(os, "geteuid") and os.geteuid() != 0:
+        return "Reloading the GPU driver needs root."
+    if not os.path.exists(AMDGPU_REFCNT_PATH):
+        return "amdgpu is built into this kernel, so it can't be reloaded."
+    if shutil.which("systemd-run") is None:
+        return "Reloading the GPU driver needs systemd."
+    if not os.path.exists(DISPLAY_MANAGER_PATH):
+        return "No display manager was found, so the display couldn't be restarted safely."
+    return None
+
+
+def _start_cu_reload_sync(value, mask, previous, previous_mask):
+    result = subprocess.run(
+        [
+            "systemd-run",
+            f"--unit={CU_RELOAD_UNIT}",
+            "--collect",
+            "--quiet",
+            "/bin/sh",
+            "-c",
+            CU_RELOAD_SCRIPT,
+            "sh",
+            str(value),
+            mask or "",
+            str(previous),
+            previous_mask or "",
+        ],
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=IO_TIMEOUT_SECONDS,
+        env=_subprocess_env(),
+    )
+    if result.returncode != 0:
+        return f"Starting the GPU driver reload failed: {result.stderr.strip()}"
+    return None
 
 
 def _read_running_cu_mask():
@@ -1578,6 +1848,7 @@ def _read_cu_unlock_sync():
         "cmdline_path": path,
         "boot_error": None if path else _boot_missing(),
         "active_cus": _read_active_cus(),
+        "reload_blocker": _cu_reload_blocker(),
     }
 
 
@@ -1671,6 +1942,8 @@ async def _restore_fan():
             ok, result = await _guarded_io(
                 "Restoring fan curve", FAN_HWMON_DESC, _write_fan_curve_sync, curve
             )
+            if ok:
+                ok, result = await _set_fan_mode_locked("Switching fan to curve mode", FAN_MODE_CURVE)
         if not ok:
             return False, result
         restored = _curve_target(curve)
@@ -1952,13 +2225,13 @@ class Plugin:
 
     async def set_fan_mode(self, mode):
         value = _coerce_int(mode)
-        if value not in (FAN_MODE_FULL, FAN_MODE_CURVE):
+        if value not in (FAN_MODE_FULL, FAN_MODE_CURVE, FAN_MODE_FIRMWARE):
             return _fail(f"Invalid fan mode: {mode!r}")
         async with _fan_lock:
             ok, deferred = await _set_fan_mode_locked("Setting fan mode", value)
         if not ok:
             return _fail(deferred)
-        label = "full speed" if value == FAN_MODE_FULL else "curve"
+        label = {FAN_MODE_FULL: "full speed", FAN_MODE_CURVE: "curve", FAN_MODE_FIRMWARE: "console firmware"}[value]
         if deferred:
             return _ok(f"Thermal guard is cooling. The fan switches to {label} once the CPU cools down")
         return _ok(f"Fan set to {label}", {"mode": value})
@@ -2237,8 +2510,12 @@ class Plugin:
         return _ok("GPU memory read", result, log=False)
 
     async def set_vram(self, megabytes):
-        if megabytes not in VRAM_CHOICES_MB:
-            return _fail(f"Unsupported VRAM size: {megabytes!r}")
+        megabytes = _coerce_int(megabytes)
+        if megabytes is None or not VRAM_MIN_MB <= megabytes <= VRAM_MAX_MB:
+            return _fail(
+                f"VRAM must be between {_format_megabytes(VRAM_MIN_MB)} and "
+                f"{_format_megabytes(VRAM_MAX_MB)}"
+            )
         async with _boot_lock:
             await _ensure_boot_mounted()
             cmdline_path = _boot_file("cmdline.txt")
@@ -2262,7 +2539,9 @@ class Plugin:
             )
         if not ok:
             return _fail(status)
-        return _ok(f"VRAM set to {megabytes} MB in vram.txt. Reboot to apply.", status)
+        return _ok(
+            f"VRAM set to {_format_megabytes(megabytes)} in vram.txt. Reboot to apply.", status
+        )
 
     async def set_gtt_limit(self, gigabytes):
         if gigabytes is not None and gigabytes not in GTT_CHOICES_GB:
@@ -2291,6 +2570,117 @@ class Plugin:
         if not ok:
             return _fail(status)
         return _ok("GTT limit saved in cmdline.txt. Reboot to apply.", status)
+
+    async def get_memory_status(self):
+        ok, result = await _guarded_io(
+            "Reading memory status", MEMINFO_PATH, _read_memory_status_sync
+        )
+        if not ok:
+            return _fail(result)
+        return _ok("Memory status read", result, log=False)
+
+    async def get_swap_settings(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, result = await _guarded_io(
+                "Reading swap settings", ZRAM_CONFIG_PATH, _read_swap_settings_sync
+            )
+        if not ok:
+            return _fail(result)
+        return _ok("Swap settings read", result, log=False)
+
+    async def set_zram(self, enabled, size=None, algorithm=None):
+        if not isinstance(enabled, bool):
+            return _fail(f"Invalid zram state: {enabled!r}")
+        if enabled and size not in ZRAM_SIZES:
+            return _fail(f"Unsupported zram size: {size!r}")
+        if enabled and algorithm not in ZRAM_ALGORITHMS:
+            return _fail(f"Unsupported zram compression: {algorithm!r}")
+        if enabled and not any(os.path.isfile(path) for path in ZRAM_GENERATOR_PATHS):
+            return _fail("zram-generator isn't installed. Install it with your package manager.")
+        async with _boot_lock:
+            ok, error = await _guarded_io(
+                "Updating the zram config",
+                ZRAM_CONFIG_PATH,
+                _write_zram_config_sync,
+                enabled,
+                size,
+                algorithm,
+            )
+            if not ok:
+                return _fail(error)
+            ok, status = await _guarded_io(
+                "Reading swap settings", ZRAM_CONFIG_PATH, _read_swap_settings_sync
+            )
+        if not ok:
+            return _fail(status)
+        state = f"set to {size} with {algorithm}" if enabled else "turned off"
+        return _ok(f"zram {state}. Reboot to apply.", status)
+
+    async def set_zswap(self, enabled):
+        if not isinstance(enabled, bool):
+            return _fail(f"Invalid zswap state: {enabled!r}")
+        if not os.path.isdir(ZSWAP_DIR):
+            return _fail("This kernel doesn't include zswap")
+        ok, error = await _guarded_io(
+            "Updating zswap",
+            ZSWAP_ENABLED_PATH,
+            _write_sysfs,
+            ZSWAP_ENABLED_PATH,
+            "Y" if enabled else "N",
+        )
+        if not ok:
+            return _fail(error)
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            path = _boot_file("cmdline.txt")
+            persisted = path is not None
+            if persisted:
+                ok, result = await _guarded_io(
+                    "Updating cmdline.txt",
+                    path,
+                    _with_writable_boot,
+                    _set_cmdline_args_sync,
+                    path,
+                    ((ZSWAP_PATTERN, f"{ZSWAP_ARG}={1 if enabled else 0}"),),
+                )
+                if not ok or result:
+                    return _fail(f"zswap changed for this boot, but {result}")
+            ok, status = await _guarded_io(
+                "Reading swap settings", ZRAM_CONFIG_PATH, _read_swap_settings_sync
+            )
+        if not ok:
+            return _fail(status)
+        state = "on" if enabled else "off"
+        if not persisted:
+            return _ok(f"zswap turned {state} until reboot. {_boot_missing()}", status)
+        return _ok(f"zswap turned {state} and saved in cmdline.txt", status)
+
+    async def reload_cu_unlock(self):
+        async with _boot_lock:
+            ok, state = await _guarded_io(
+                "Reading CU unlock", CU_UNLOCK_PARAM_PATH, _read_cu_unlock_sync
+            )
+            if not ok:
+                return _fail(state)
+            if state["running"] is None or state["configured"] is None:
+                return _fail("CU unlock isn't available on this system")
+            if not state["pending"]:
+                return _fail("There is no CU unlock change to apply")
+            if state["reload_blocker"]:
+                return _fail(state["reload_blocker"])
+            ok, error = await _guarded_io(
+                "Starting the GPU driver reload",
+                CU_RELOAD_UNIT,
+                _start_cu_reload_sync,
+                state["configured"],
+                state["configured_mask"],
+                state["running"],
+                state["running_mask"],
+            )
+            if not ok or error:
+                return _fail(error)
+        return _ok("GPU driver reload started")
 
     async def _main(self):
         global _guard_task, _led_loop_task, _restore_task
