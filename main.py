@@ -106,6 +106,49 @@ CU_MASK_PATTERN = re.compile(r"(?:^|\s+)amdgpu\.disable[-_]cu=(\S*)")
 CU_MASK_38 = "0.0.0"
 CU_TARGETS = {0: (0, None), 38: (CU_UNLOCK_ALL, CU_MASK_38), 40: (CU_UNLOCK_ALL, None)}
 ACTIVE_CU_PATTERN = re.compile(r"active_cu_number (\d+)")
+GPU_TEMP_LIMIT_PARAM_PATH = "/sys/module/ps5_gpufreq/parameters/temp_limit"
+GPU_TEMP_LIMIT_ARG = "ps5_gpufreq.temp_limit"
+GPU_TEMP_LIMIT_PATTERN = re.compile(r"(?:^|\s+)ps5[-_]gpufreq\.temp[-_]limit=(\S*)")
+GPU_TEMP_LIMIT_MIN = 50
+GPU_TEMP_LIMIT_MAX = 95
+GPU_TEMP_LIMIT_DEFAULT = 85
+GPU_PCI_GLOB = "/sys/class/drm/card[0-9]*/device"
+PRO_GPU_DEVICE_IDS = (0x13DA, 0x13DC)
+VIOLA_FIRMWARE_PATTERN = re.compile(r"using Viola firmware", re.IGNORECASE)
+VIOLA_MENTION_PATTERN = re.compile(r"\bviola[_ ]", re.IGNORECASE)
+OLD_MP1_PATTERN = re.compile(r"mp1fw_sendmsg: Error : busy")
+COREDUMP_GLOB = "/sys/class/drm/card[0-9]*/device/devcoredump/data"
+BT_RESYNC_PARAM_PATH = "/sys/module/btusb/parameters/ps5_ep_resync"
+BT_RESYNC_ARG = "btusb.ps5_ep_resync"
+BT_RESYNC_PATTERN = re.compile(r"(?:^|\s+)btusb\.ps5[-_]ep[-_]resync=(\S*)")
+VIOLA_ENV_PATH = "/etc/environment.d/90-ps5-viola.conf"
+VIOLA_ENV_VARS = ("AMD_VIOLA_COMPUTE_QUEUE", "RADV_VIOLA_ML")
+ENV_FLAG_LINE = re.compile(r"^\s*(?:export\s+)?([A-Z0-9_]+)\s*=\s*\"?0\"?\s*$")
+COMPUTE_QUEUE_ENV_PATH = "/etc/environment.d/90-ps5-compute-queue.conf"
+COMPUTE_QUEUE_ENV_VARS = ("AMD_PS5_COMPUTE_QUEUE",)
+CPU_BOOST_PATH = "/sys/devices/system/cpu/cpufreq/boost"
+MODULE_DIR = "/sys/module"
+BOOT_OPTIONS = {
+    "force_1080p": ("amdgpu.force_1080p=1", "amdgpu/parameters/force_1080p"),
+    "no_4k120": ("hdmi.frl_4k120=0", "hdmi/parameters/frl_4k120"),
+    "no_vrr": ("hdmi.vrr=0", "hdmi/parameters/vrr"),
+    "no_cec_wake": ("ps5_cec.one_touch_play=0", "ps5_cec/parameters/one_touch_play"),
+    "usbc_dp": ("usbc_dp.enable=1", "usbc_dp/parameters/enable"),
+    "idle_halt": ("idle=halt", None),
+}
+HDMI_PARAMS_DIR = f"{MODULE_DIR}/hdmi/parameters"
+HDMI_STATUS_PARAMS = ("frl_rate", "frl_rate_max", "frl_failed", "allm_active", "recovery_status")
+SWAPFILE_PATH = "/swapfile"
+SWAPFILE_SIZES_GB = (4, 8, 16)
+SWAPFILE_TIMEOUT_SECONDS = 120.0
+FSTAB_PATH = "/etc/fstab"
+FSTAB_SWAP_LINE = f"{SWAPFILE_PATH} none swap sw 0 0"
+SWAPPINESS_PATH = "/proc/sys/vm/swappiness"
+SWAPPINESS_CONF_PATH = "/etc/sysctl.d/90-ps5-hwcon-swappiness.conf"
+SWAPPINESS_MAX = 200
+BAZZITE_KEXEC = "ps5-kexec"
+KEXEC_LOADED_PATH = "/sys/kernel/kexec_loaded"
+OSTREE_STAGED_PATH = "/run/ostree/staged-deployment"
 
 BOOT_MOUNT = "/boot/efi"
 BOOT_EFI_MOUNT = "/efi"
@@ -216,6 +259,7 @@ DEFAULT_SETTINGS = {
     "saved_gpu_governor": None,
     "saved_cpu_clock": None,
     "saved_gpu_clock": None,
+    "saved_cpu_boost": None,
 }
 
 _fan_lock = asyncio.Lock()
@@ -234,6 +278,7 @@ _guard_task = None
 _led_loop_task = None
 _restore_task = None
 _settings_loaded = False
+_console_detection = None
 
 
 def _ok(message, data=None, log=True):
@@ -593,6 +638,8 @@ def _sanitize_settings(raw):
         clock = _coerce_int(raw.get(key))
         if clock is not None and CLOCK_MHZ_MIN <= clock <= CLOCK_MHZ_MAX:
             settings[key] = clock
+    if isinstance(raw.get("saved_cpu_boost"), bool):
+        settings["saved_cpu_boost"] = raw["saved_cpu_boost"]
     return settings
 
 
@@ -1102,6 +1149,7 @@ def _scan_cpufreq():
         "policy_count": len(policies),
         "freq_avg_mhz": round(sum(current) / len(current)) if current else None,
         "freq_peak_mhz": max(current) if current else None,
+        "boost": _read_cpu_boost(),
         "hw_min_mhz": min(hw_min) if hw_min else None,
         "hw_max_mhz": max(hw_max) if hw_max else None,
         "available_mhz": sorted(available or []),
@@ -1324,14 +1372,14 @@ def _boot_file_in(mount, name):
     return None
 
 
-def _run_command(*args):
+def _run_command(*args, timeout=IO_TIMEOUT_SECONDS):
     try:
         return subprocess.run(
             args,
             capture_output=True,
             text=True,
             errors="replace",
-            timeout=IO_TIMEOUT_SECONDS,
+            timeout=timeout,
             env=_subprocess_env(),
         )
     except (OSError, subprocess.SubprocessError):
@@ -1906,6 +1954,381 @@ async def _apply_gpu_clock_locked(action, mhz):
     return True, confirmed
 
 
+def _temp_limit_from(line):
+    values = GPU_TEMP_LIMIT_PATTERN.findall(line)
+    return _coerce_int(values[-1]) if values else None
+
+
+def _read_gpu_temp_limit_sync():
+    try:
+        running = _coerce_int(_read_sysfs(GPU_TEMP_LIMIT_PARAM_PATH))
+    except (OSError, UnicodeDecodeError):
+        try:
+            running = _temp_limit_from(_read_sysfs(RUNNING_CMDLINE_PATH))
+        except (OSError, UnicodeDecodeError):
+            running = None
+    running = running or GPU_TEMP_LIMIT_DEFAULT
+    path = _boot_file("cmdline.txt")
+    configured = None
+    if path is not None:
+        line, _rest = _split_cmdline(_read_cmdline_sync(path))
+        configured = _temp_limit_from(line) or GPU_TEMP_LIMIT_DEFAULT
+    return {
+        "supported": os.path.exists(GPU_TEMP_LIMIT_PARAM_PATH) or os.path.isdir(GPU_DEVFREQ_PATH),
+        "running": running,
+        "configured": configured,
+        "pending": configured is not None and configured != running,
+        "default": GPU_TEMP_LIMIT_DEFAULT,
+        "min": GPU_TEMP_LIMIT_MIN,
+        "max": GPU_TEMP_LIMIT_MAX,
+        "cmdline_path": path,
+        "boot_error": None if path else _boot_missing(),
+    }
+
+
+def _read_env_flags_sync(path, variables):
+    enabled = set()
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                match = ENV_FLAG_LINE.match(line)
+                if match and match.group(1) in variables:
+                    enabled.add(match.group(1))
+    except FileNotFoundError:
+        pass
+    return {name: name in enabled for name in variables}
+
+
+def _write_env_flags_sync(path, variables, values):
+    names = [name for name in variables if values.get(name)]
+    if not names:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    original = None
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            original = handle.read()
+    lines = ["# Written by PS5 Hardware Control"] + [f"{name}=0" for name in names]
+    data = ("\n".join(lines) + "\n").encode("utf-8")
+    if data == original:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _replace_file_sync(path, data)
+
+
+def _read_viola_env_sync():
+    return _read_env_flags_sync(VIOLA_ENV_PATH, VIOLA_ENV_VARS)
+
+
+def _write_viola_env_sync(values):
+    _write_env_flags_sync(VIOLA_ENV_PATH, VIOLA_ENV_VARS, values)
+
+
+def _read_gpu_pci_id():
+    for base in sorted(glob.glob(GPU_PCI_GLOB)):
+        try:
+            vendor = int(_read_sysfs(os.path.join(base, "vendor")), 16)
+            device = int(_read_sysfs(os.path.join(base, "device")), 16)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if vendor == 0x1002:
+            return device
+    return None
+
+
+def _detect_console_sync():
+    device = _read_gpu_pci_id()
+    if device is not None:
+        pro = device in PRO_GPU_DEVICE_IDS
+        return {
+            "detected": "pro" if pro else "base",
+            "device_id": f"1002:{device:04x}",
+            "source": f"GPU PCI ID 1002:{device:04x}",
+        }
+    result = _run_command("dmesg")
+    if result is not None and VIOLA_MENTION_PATTERN.search(result.stdout):
+        return {"detected": "pro", "device_id": None, "source": "Viola firmware in dmesg"}
+    return {"detected": None, "device_id": None, "source": None}
+
+
+def _find_coredump():
+    return next(iter(sorted(glob.glob(COREDUMP_GLOB))), None)
+
+
+def _read_pro_status_sync():
+    status = {
+        "active_cus": None,
+        "viola_firmware": None,
+        "old_kernel": False,
+        "coredump": _find_coredump(),
+        "viola_env": _read_viola_env_sync(),
+    }
+    result = _run_command("dmesg")
+    if result is not None:
+        counts = ACTIVE_CU_PATTERN.findall(result.stdout)
+        status["active_cus"] = int(counts[-1]) if counts else None
+        status["viola_firmware"] = bool(VIOLA_FIRMWARE_PATTERN.search(result.stdout))
+        status["old_kernel"] = bool(OLD_MP1_PATTERN.search(result.stdout))
+    return status
+
+
+def _save_coredump_sync():
+    source = _find_coredump()
+    if source is None:
+        raise FileNotFoundError(errno.ENOENT, "No GPU crash dump", COREDUMP_GLOB)
+    home = (
+        getattr(decky_plugin, "DECKY_USER_HOME", None)
+        or os.environ.get("DECKY_USER_HOME")
+        or os.path.expanduser("~")
+    )
+    target = os.path.join(home, time.strftime("gpu-coredump-%Y%m%d-%H%M%S.txt"))
+    with open(source, "rb") as reader, open(target, "wb") as writer:
+        shutil.copyfileobj(reader, writer)
+    owner = os.stat(home)
+    if owner.st_uid != os.geteuid():
+        os.chown(target, owner.st_uid, owner.st_gid)
+    return target
+
+
+def _bt_resync_from(line):
+    values = BT_RESYNC_PATTERN.findall(line)
+    return _kernel_bool(values[-1]) if values else False
+
+
+def _read_bt_resync_sync():
+    supported = os.path.exists(BT_RESYNC_PARAM_PATH)
+    running = False
+    if supported:
+        try:
+            running = _kernel_bool(_read_sysfs(BT_RESYNC_PARAM_PATH))
+        except (OSError, UnicodeDecodeError):
+            pass
+    path = _boot_file("cmdline.txt")
+    configured = None
+    if path is not None:
+        configured = _bt_resync_from(_split_cmdline(_read_cmdline_sync(path))[0])
+    return {
+        "supported": supported,
+        "running": running,
+        "configured": configured,
+        "pending": configured is not None and configured != running,
+        "cmdline_path": path,
+        "boot_error": None if path else _boot_missing(),
+    }
+
+
+def _read_cpu_boost():
+    try:
+        return _kernel_bool(_read_sysfs(CPU_BOOST_PATH))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _boot_option_pattern(argument):
+    name = re.escape(argument.split("=", 1)[0]).replace("_", "[-_]")
+    return re.compile(rf"(?:^|\s+){name}=(\S*)")
+
+
+def _boot_option_set(line, argument):
+    values = _boot_option_pattern(argument).findall(line)
+    return bool(values) and values[-1] == argument.split("=", 1)[1]
+
+
+def _read_hdmi_status_sync():
+    if not os.path.isdir(HDMI_PARAMS_DIR):
+        return None
+    status = {}
+    for name in HDMI_STATUS_PARAMS:
+        try:
+            status[name] = _read_sysfs(os.path.join(HDMI_PARAMS_DIR, name))
+        except (OSError, UnicodeDecodeError):
+            status[name] = None
+    return status
+
+
+def _read_boot_options_sync():
+    path = _boot_file("cmdline.txt")
+    line = _split_cmdline(_read_cmdline_sync(path))[0] if path else None
+    try:
+        running_line = _read_sysfs(RUNNING_CMDLINE_PATH)
+    except (OSError, UnicodeDecodeError):
+        running_line = None
+    options = {}
+    for key, (argument, parameter) in BOOT_OPTIONS.items():
+        configured = _boot_option_set(line, argument) if line is not None else None
+        running = _boot_option_set(running_line, argument) if running_line is not None else None
+        options[key] = {
+            "supported": parameter is None or os.path.exists(os.path.join(MODULE_DIR, parameter)),
+            "configured": configured,
+            "running": running,
+            "pending": None not in (configured, running) and configured != running,
+        }
+    return {
+        "options": options,
+        "hdmi": _read_hdmi_status_sync(),
+        "cmdline_path": path,
+        "boot_error": None if path else _boot_missing(),
+    }
+
+
+def _read_warm_reboot_sync():
+    kernel, initrd = _boot_file("bzImage"), _boot_file("initrd.img")
+    reason = None
+    if shutil.which(BAZZITE_KEXEC) is None and shutil.which("kexec") is None:
+        reason = "Install kexec-tools to restart without the PS5 OS."
+    elif kernel is None or initrd is None:
+        reason = "bzImage or initrd.img wasn't found on the boot partition."
+    return {"available": reason is None, "reason": reason}
+
+
+def _kexec_loaded():
+    try:
+        return _read_sysfs(KEXEC_LOADED_PATH) == "1"
+    except OSError:
+        return False
+
+
+def _bazzite_warm_reboot_sync():
+    if os.path.exists(OSTREE_STAGED_PATH):
+        return "An update is staged. Restart normally once so the boot partition gets the new kernel."
+    result = _run_command(BAZZITE_KEXEC, "load")
+    if result is None or result.returncode != 0 or not _kexec_loaded():
+        output = result.stdout.strip() if result is not None else ""
+        return f"{BAZZITE_KEXEC} couldn't load the kernel: {output or 'no kernel loaded'}."
+    result = _run_command("systemctl", "kexec", "-i")
+    if result is None or result.returncode != 0:
+        _run_command(BAZZITE_KEXEC, "unload")
+        return _command_error(result, "systemctl kexec")
+    return None
+
+
+def _warm_reboot_sync():
+    if shutil.which(BAZZITE_KEXEC):
+        return _bazzite_warm_reboot_sync()
+    kernel, initrd, cmdline = (_boot_file(name) for name in ("bzImage", "initrd.img", "cmdline.txt"))
+    if None in (kernel, initrd, cmdline):
+        return "bzImage, initrd.img or cmdline.txt is missing from the boot partition."
+    line = _split_cmdline(_read_cmdline_sync(cmdline))[0].strip()
+    result = _run_command("kexec", "-l", kernel, f"--initrd={initrd}", f"--append={line}")
+    if result is None or result.returncode != 0:
+        return _command_error(result, "kexec")
+    if shutil.which("systemctl"):
+        result = _run_command("systemctl", "kexec", "-i")
+        name = "systemctl kexec"
+    else:
+        result = _run_command("kexec", "-e")
+        name = "kexec"
+    if result is None or result.returncode != 0:
+        return _command_error(result, name)
+    return None
+
+
+def _root_filesystem():
+    try:
+        with open(MOUNTS_PATH, encoding="utf-8", errors="replace") as handle:
+            rows = [row.split() for row in handle]
+    except OSError:
+        return None
+    return next((row[2] for row in rows if len(row) >= 3 and row[1] == "/"), None)
+
+
+def _swapfile_active():
+    return any(swap["name"] == SWAPFILE_PATH for swap in _read_swaps())
+
+
+def _fstab_has_swapfile(lines):
+    return any(line.split()[:1] == [SWAPFILE_PATH] for line in lines)
+
+
+def _read_fstab_lines():
+    try:
+        with open(FSTAB_PATH, encoding="utf-8", errors="replace") as handle:
+            return handle.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def _read_swap_file_sync():
+    try:
+        swappiness = int(_read_sysfs(SWAPPINESS_PATH))
+    except (OSError, ValueError, UnicodeDecodeError):
+        swappiness = None
+    exists = os.path.isfile(SWAPFILE_PATH)
+    stats = os.statvfs(os.path.dirname(SWAPFILE_PATH) or "/")
+    return {
+        "exists": exists,
+        "size": os.path.getsize(SWAPFILE_PATH) if exists else None,
+        "active": _swapfile_active(),
+        "permanent": _fstab_has_swapfile(_read_fstab_lines()),
+        "filesystem": _root_filesystem(),
+        "free": stats.f_bavail * stats.f_frsize,
+        "swappiness": swappiness,
+        "sizes_gb": list(SWAPFILE_SIZES_GB),
+    }
+
+
+def _write_fstab_sync(lines):
+    original = None
+    if os.path.isfile(FSTAB_PATH):
+        with open(FSTAB_PATH, "rb") as handle:
+            original = handle.read()
+    _replace_file_sync(FSTAB_PATH, ("\n".join(lines) + "\n").encode("utf-8"), original)
+
+
+def _create_swap_file_sync(gigabytes):
+    if os.path.exists(SWAPFILE_PATH):
+        return f"{SWAPFILE_PATH} already exists."
+    size = gigabytes * 1024**3
+    stats = os.statvfs(os.path.dirname(SWAPFILE_PATH) or "/")
+    if stats.f_bavail * stats.f_frsize < size + 1024**3:
+        return f"There isn't enough free space for a {gigabytes} GB swap file."
+    timeout = SWAPFILE_TIMEOUT_SECONDS
+    try:
+        if _root_filesystem() == "btrfs":
+            steps = [("btrfs", "filesystem", "mkswapfile", "--size", f"{gigabytes}G", SWAPFILE_PATH)]
+        else:
+            steps = [("fallocate", "-l", f"{gigabytes}G", SWAPFILE_PATH), ("mkswap", SWAPFILE_PATH)]
+        for index, step in enumerate(steps):
+            result = _run_command(*step, timeout=timeout)
+            if result is None or result.returncode != 0:
+                raise RuntimeError(_command_error(result, step[0]))
+            if index == 0:
+                os.chmod(SWAPFILE_PATH, 0o600)
+        result = _run_command("swapon", SWAPFILE_PATH, timeout=timeout)
+        if result is None or result.returncode != 0:
+            raise RuntimeError(_command_error(result, "swapon"))
+    except RuntimeError as exc:
+        if os.path.exists(SWAPFILE_PATH):
+            os.remove(SWAPFILE_PATH)
+        return str(exc)
+    lines = _read_fstab_lines()
+    if not _fstab_has_swapfile(lines):
+        _write_fstab_sync(lines + [FSTAB_SWAP_LINE])
+    return None
+
+
+def _remove_swap_file_sync():
+    if _swapfile_active():
+        result = _run_command("swapoff", SWAPFILE_PATH, timeout=SWAPFILE_TIMEOUT_SECONDS)
+        if result is None or result.returncode != 0:
+            return _command_error(result, "swapoff")
+    if os.path.exists(SWAPFILE_PATH):
+        os.remove(SWAPFILE_PATH)
+    lines = _read_fstab_lines()
+    if _fstab_has_swapfile(lines):
+        _write_fstab_sync([line for line in lines if line.split()[:1] != [SWAPFILE_PATH]])
+    return None
+
+
+def _write_swappiness_sync(value):
+    _write_sysfs(SWAPPINESS_PATH, value)
+    os.makedirs(os.path.dirname(SWAPPINESS_CONF_PATH), exist_ok=True)
+    _replace_file_sync(
+        SWAPPINESS_CONF_PATH, f"# Written by PS5 Hardware Control\nvm.swappiness = {value}\n".encode()
+    )
+
+
 def _gpu_settings_snapshot():
     return {
         "restore_on_boot": _settings["gpu_restore_on_boot"],
@@ -1919,6 +2342,7 @@ def _cpu_settings_snapshot():
         "restore_on_boot": _settings["cpu_restore_on_boot"],
         "saved_governor": _settings["saved_governor"],
         "saved_clock": _settings["saved_cpu_clock"],
+        "saved_boost": _settings["saved_cpu_boost"],
     }
 
 
@@ -1984,6 +2408,17 @@ async def _restore_cpu_clock():
     return True, f"Restored CPU clock lock at {result['locked_mhz']} MHz"
 
 
+async def _restore_cpu_boost():
+    boost = _settings["saved_cpu_boost"]
+    if not _settings["cpu_restore_on_boot"] or boost is None:
+        return True, None
+    if not os.path.exists(CPU_BOOST_PATH):
+        return True, None
+    async with _cpu_lock:
+        ok, result = await _guarded_io("Restoring CPU boost", CPU_BOOST_PATH, _write_sysfs, CPU_BOOST_PATH, int(boost))
+    return (True, f"Restored CPU boost {'on' if boost else 'off'}") if ok else (False, result)
+
+
 async def _restore_gpu_governor():
     governor = _settings["saved_gpu_governor"]
     if not _settings["gpu_restore_on_boot"] or not governor:
@@ -2026,6 +2461,7 @@ _RESTORES = (
     ("fan", _restore_fan),
     ("CPU governor", _restore_cpu_governor),
     ("CPU clock", _restore_cpu_clock),
+    ("CPU boost", _restore_cpu_boost),
     ("GPU governor", _restore_gpu_governor),
     ("GPU clock", _restore_gpu_clock),
     ("LED preset", _restore_led),
@@ -2655,6 +3091,270 @@ class Plugin:
         if not persisted:
             return _ok(f"zswap turned {state} until reboot. {_boot_missing()}", status)
         return _ok(f"zswap turned {state} and saved in cmdline.txt", status)
+
+    async def set_cpu_boost(self, enabled):
+        if not isinstance(enabled, bool):
+            return _fail(f"Invalid CPU boost value: {enabled!r}")
+        if not os.path.exists(CPU_BOOST_PATH):
+            return _fail("This kernel has no CPU boost switch (rmuxnet's kernel has one)")
+        async with _cpu_lock:
+            ok, error = await _guarded_io("Setting CPU boost", CPU_BOOST_PATH, _write_sysfs, CPU_BOOST_PATH, int(enabled))
+            if not ok:
+                return _fail(error)
+            ok, result = await _read_cpufreq()
+        await _remember_setting("saved_cpu_boost", enabled)
+        if not ok:
+            return _fail(result)
+        return _ok(f"CPU boost turned {'on' if enabled else 'off'}", result)
+
+    async def get_gpu_temp_limit(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, result = await _guarded_io(
+                "Reading the GPU thermal limit", RUNNING_CMDLINE_PATH, _read_gpu_temp_limit_sync
+            )
+        if not ok:
+            return _fail(result)
+        return _ok("GPU thermal limit read", result, log=False)
+
+    async def set_gpu_temp_limit(self, celsius):
+        celsius = _coerce_int(celsius)
+        if celsius is None or not GPU_TEMP_LIMIT_MIN <= celsius <= GPU_TEMP_LIMIT_MAX:
+            return _fail(
+                f"The GPU thermal limit must be between {GPU_TEMP_LIMIT_MIN} and "
+                f"{GPU_TEMP_LIMIT_MAX} °C"
+            )
+        argument = None
+        if celsius != GPU_TEMP_LIMIT_DEFAULT:
+            argument = f"{GPU_TEMP_LIMIT_ARG}={celsius}"
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            path = _boot_file("cmdline.txt")
+            if path is None:
+                return _fail(_boot_missing())
+            ok, result = await _guarded_io(
+                "Updating cmdline.txt",
+                path,
+                _with_writable_boot,
+                _set_cmdline_args_sync,
+                path,
+                ((GPU_TEMP_LIMIT_PATTERN, argument),),
+            )
+            if not ok or result:
+                return _fail(result)
+            ok, status = await _guarded_io(
+                "Reading the GPU thermal limit", path, _read_gpu_temp_limit_sync
+            )
+        if not ok:
+            return _fail(status)
+        suffix = "Reboot to apply." if status["pending"] else "It's already in effect."
+        return _ok(f"GPU thermal limit set to {celsius} °C in cmdline.txt. {suffix}", status)
+
+    async def get_console(self):
+        global _console_detection
+        if _console_detection is None or _console_detection["detected"] is None:
+            ok, result = await _guarded_io(
+                "Detecting the console model", GPU_PCI_GLOB, _detect_console_sync
+            )
+            if not ok:
+                return _fail(result)
+            _console_detection = result
+            if result["detected"]:
+                name = "PS5 Pro" if result["detected"] == "pro" else "PS5"
+                logger.info(f"Detected {name} from the {result['source']}")
+        info = dict(_console_detection, pro=_console_detection["detected"] == "pro")
+        return _ok("Console model read", info, log=False)
+
+    async def get_pro_status(self):
+        ok, result = await _guarded_io("Reading PS5 Pro status", VIOLA_ENV_PATH, _read_pro_status_sync)
+        if not ok:
+            return _fail(result)
+        return _ok("PS5 Pro status read", result, log=False)
+
+    async def save_gpu_coredump(self):
+        if await _run_detached(_find_coredump) is None:
+            return _fail(
+                "There's no GPU crash dump to save. The kernel deletes it about 5 minutes after "
+                "the fault, and at reboot."
+            )
+        ok, result = await _guarded_io("Saving the GPU crash dump", COREDUMP_GLOB, _save_coredump_sync)
+        if not ok:
+            return _fail(result)
+        return _ok(f"GPU crash dump saved to {result}", {"path": result})
+
+    async def get_bt_resync(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, result = await _guarded_io(
+                "Reading the Bluetooth fix", BT_RESYNC_PARAM_PATH, _read_bt_resync_sync
+            )
+        if not ok:
+            return _fail(result)
+        return _ok("Bluetooth fix read", result, log=False)
+
+    async def set_bt_resync(self, enabled):
+        if not isinstance(enabled, bool):
+            return _fail(f"Invalid Bluetooth fix value: {enabled!r}")
+        async with _boot_lock:
+            if not os.path.exists(BT_RESYNC_PARAM_PATH):
+                return _fail(f"This kernel doesn't support {BT_RESYNC_ARG}")
+            await _ensure_boot_mounted()
+            path = _boot_file("cmdline.txt")
+            if path is None:
+                return _fail(_boot_missing())
+            ok, result = await _guarded_io(
+                "Updating cmdline.txt",
+                path,
+                _with_writable_boot,
+                _set_cmdline_args_sync,
+                path,
+                ((BT_RESYNC_PATTERN, f"{BT_RESYNC_ARG}=1" if enabled else None),),
+            )
+            if not ok or result:
+                return _fail(result)
+            ok, status = await _guarded_io(
+                "Reading the Bluetooth fix", path, _read_bt_resync_sync
+            )
+        if not ok:
+            return _fail(status)
+        state = "turned on" if enabled else "turned off"
+        suffix = "Reboot to apply." if status["pending"] else "It's already in effect."
+        return _ok(f"Bluetooth fix {state} in cmdline.txt. {suffix}", status)
+
+    async def set_viola_env(self, name, enabled):
+        if name not in VIOLA_ENV_VARS or not isinstance(enabled, bool):
+            return _fail(f"Invalid PS5 Pro setting: {name!r}={enabled!r}")
+        ok, values = await _guarded_io("Reading PS5 Pro settings", VIOLA_ENV_PATH, _read_viola_env_sync)
+        if not ok:
+            return _fail(values)
+        values[name] = enabled
+        ok, error = await _guarded_io(
+            "Updating PS5 Pro settings", VIOLA_ENV_PATH, _write_viola_env_sync, values
+        )
+        if not ok:
+            return _fail(error)
+        ok, status = await _guarded_io("Reading PS5 Pro status", VIOLA_ENV_PATH, _read_pro_status_sync)
+        if not ok:
+            return _fail(status)
+        state = "set" if enabled else "removed"
+        return _ok(f"{name}=0 {state}. Log out and back in to apply.", status)
+
+    async def get_compute_queue(self):
+        ok, values = await _guarded_io(
+            "Reading the compute queue setting", COMPUTE_QUEUE_ENV_PATH,
+            _read_env_flags_sync, COMPUTE_QUEUE_ENV_PATH, COMPUTE_QUEUE_ENV_VARS,
+        )
+        if not ok:
+            return _fail(values)
+        return _ok("Compute queue setting read", {"hidden": values["AMD_PS5_COMPUTE_QUEUE"]}, log=False)
+
+    async def set_compute_queue(self, hidden):
+        if not isinstance(hidden, bool):
+            return _fail(f"Invalid compute queue value: {hidden!r}")
+        ok, error = await _guarded_io(
+            "Updating the compute queue setting", COMPUTE_QUEUE_ENV_PATH, _write_env_flags_sync,
+            COMPUTE_QUEUE_ENV_PATH, COMPUTE_QUEUE_ENV_VARS, {"AMD_PS5_COMPUTE_QUEUE": hidden},
+        )
+        if not ok:
+            return _fail(error)
+        state = "set" if hidden else "removed"
+        return _ok(f"AMD_PS5_COMPUTE_QUEUE=0 {state}. Log out and back in to apply.", {"hidden": hidden})
+
+    async def get_boot_options(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, result = await _guarded_io("Reading boot options", BOOT_MOUNT, _read_boot_options_sync)
+        if not ok:
+            return _fail(result)
+        return _ok("Boot options read", result, log=False)
+
+    async def set_boot_option(self, key, enabled):
+        if key not in BOOT_OPTIONS or not isinstance(enabled, bool):
+            return _fail(f"Invalid boot option: {key!r}={enabled!r}")
+        argument, _parameter = BOOT_OPTIONS[key]
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, state = await _guarded_io("Reading boot options", BOOT_MOUNT, _read_boot_options_sync)
+            if not ok:
+                return _fail(state)
+            if enabled and not state["options"][key]["supported"]:
+                return _fail(f"This kernel doesn't support {argument}")
+            path = state["cmdline_path"]
+            if path is None:
+                return _fail(_boot_missing())
+            ok, error = await _guarded_io(
+                "Updating cmdline.txt", path, _with_writable_boot, _set_cmdline_args_sync, path,
+                ((_boot_option_pattern(argument), argument if enabled else None),),
+            )
+            if not ok or error:
+                return _fail(error)
+            ok, state = await _guarded_io("Reading boot options", path, _read_boot_options_sync)
+        if not ok:
+            return _fail(state)
+        action = "added to" if enabled else "removed from"
+        suffix = "Reboot to apply." if state["options"][key]["pending"] else "It's already in effect."
+        return _ok(f"{argument} {action} cmdline.txt. {suffix}", state)
+
+    async def retry_hdmi_frl(self):
+        path = os.path.join(HDMI_PARAMS_DIR, "frl_failed")
+        ok, error = await _guarded_io("Retrying the 4K120 link", path, _write_sysfs, path, "N")
+        if not ok:
+            return _fail(error)
+        return _ok("Retrying the 4K120 link. The screen may go black for a moment.")
+
+    async def get_warm_reboot(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, result = await _guarded_io("Checking warm reboot", BOOT_MOUNT, _read_warm_reboot_sync)
+        if not ok:
+            return _fail(result)
+        return _ok("Warm reboot checked", result, log=False)
+
+    async def warm_reboot(self):
+        async with _boot_lock:
+            await _ensure_boot_mounted()
+            ok, error = await _guarded_io("Warm reboot", BOOT_MOUNT, _warm_reboot_sync)
+        if not ok or error:
+            return _fail(error)
+        return _ok("Restarting Linux…")
+
+    async def get_swap_file(self):
+        ok, result = await _guarded_io("Reading swap file", SWAPFILE_PATH, _read_swap_file_sync)
+        if not ok:
+            return _fail(result)
+        return _ok("Swap file read", result, log=False)
+
+    async def _swap_file_job(self, action, done, func, *args):
+        try:
+            error = await asyncio.wait_for(_run_detached(func, *args), timeout=SWAPFILE_TIMEOUT_SECONDS + 10)
+        except Exception as exc:
+            error = f"{action} failed: {exc}"
+        if error:
+            return _fail(error)
+        ok, state = await _guarded_io("Reading swap file", SWAPFILE_PATH, _read_swap_file_sync)
+        return _ok(done, state) if ok else _fail(state)
+
+    async def create_swap_file(self, gigabytes):
+        if gigabytes not in SWAPFILE_SIZES_GB:
+            return _fail(f"Invalid swap file size: {gigabytes!r}")
+        return await self._swap_file_job(
+            "Creating the swap file", f"{gigabytes} GB swap file created at {SWAPFILE_PATH} and turned on",
+            _create_swap_file_sync, gigabytes,
+        )
+
+    async def remove_swap_file(self):
+        return await self._swap_file_job(
+            "Removing the swap file", f"Swap file {SWAPFILE_PATH} turned off and removed",
+            _remove_swap_file_sync,
+        )
+
+    async def set_swappiness(self, value):
+        value = _coerce_int(value)
+        if value is None or not 0 <= value <= SWAPPINESS_MAX:
+            return _fail(f"Swappiness must be 0-{SWAPPINESS_MAX}")
+        return await self._swap_file_job(
+            "Setting swappiness", f"Swappiness set to {value}", _write_swappiness_sync, value
+        )
 
     async def reload_cu_unlock(self):
         async with _boot_lock:

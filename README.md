@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan curve or target temperature, live temperatures, CPU and GPU governors and clocks, GPU memory, zram and zswap, and indicator LED presets, all from the Quick Access Menu.
+  A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan curve or target temperature, live temperatures, CPU and GPU governors and clocks, CPU boost, GPU thermal limit, GPU memory, zram, zswap and a swap file, display boot options, warm reboot and indicator LED presets, all from the Quick Access Menu.
 </p>
 
 ---
@@ -94,9 +94,14 @@ Restore on Startup applies each setting as soon as its driver is ready. If a dri
 - **Governor**: lists every cpufreq governor the kernel offers (`scaling_available_governors`) and applies your choice to all CPUs. Only governors built into or loaded by the kernel are shown.
 - **Status**: active governor, average and peak clock, hardware range and the cpufreq driver, refreshed every 2 s. If CPUs disagree, it shows **Mixed**.
 - **Manual Clock**: locks every CPU to one clock by setting `scaling_min_freq` and `scaling_max_freq` to the same value. The slider covers the hardware range and snaps to `scaling_available_frequencies` when the driver lists them. The lock applies under any governor. **Automatic** restores the full range.
-- **Restore on Startup**: re-applies your last governor and clock lock when Decky starts.
+- **Boost to 3.5 GHz**: turns the CPU boost on or off through `/sys/devices/system/cpu/cpufreq/boost`. Shown only on kernels that have it (rmuxnet's kernel).
+- **Restore on Startup**: re-applies your last governor, clock lock and boost when Decky starts.
 
 With an EPP driver such as `amd-pstate-epp`, the kernel only offers Performance and Powersave. The firmware still manages clocks under Powersave.
+
+### Console model
+
+The plugin detects a PS5 Pro from its GPU PCI ID (`1002:13da` or `1002:13dc`). If no AMD GPU shows up in sysfs, it checks dmesg for the Pro's Viola firmware instead. There's nothing to set: on a Pro the GPU tab shows the Pro settings below and hides CU Unlock, since all 60 CUs are already on. The CPU tab says the firmware sets the CPU clocks, and the RAM tab suggests 4 GB of VRAM if games crash after long sessions.
 
 ### GPU
 
@@ -104,10 +109,14 @@ With an EPP driver such as `amd-pstate-epp`, the kernel only offers Performance 
 - **Status**: active governor, current GPU clock, target clock and the allowed range, refreshed every 2 s.
 - **Manual Clock**: locks the GPU to one of the frequencies in `available_frequencies` by setting the devfreq `min_freq` and `max_freq` to the same value. The lock applies under any governor. **Automatic** removes both limits.
 - **Restore on Startup**: re-applies your last GPU governor and clock lock when Decky starts.
+- **Thermal Limit**: the GPU temperature where `ps5-gpufreq` starts lowering the clock (50–95 °C, 85 °C by default). It's read at boot, so it saves `ps5_gpufreq.temp_limit` in `cmdline.txt` and needs a reboot. Picking 85 °C removes the argument. It asks before saving a value above 85 °C.
+- **Micro-stutter Fix**: removes `idle=halt` from `cmdline.txt`, the wiki's first fix for micro-stutter. Needs a reboot.
+- **Hide Compute Queue** (base PS5 and Slim): writes `AMD_PS5_COMPUTE_QUEUE=0` to `/etc/environment.d/90-ps5-compute-queue.conf`, for a game that glitches or hangs with PS5 Bazzite Deck's Mesa. Applies after logging out and back in.
 
 - **CU Unlock**: turns on the compute units disabled at the factory (36 or 38 active out of 40). **40 CUs** adds `amdgpu.ps5_cu_unlock=3` to `cmdline.txt` on the boot drive, and **38 CUs** also adds `amdgpu.disable_cu=0.0.0` to mask one pair, so both need a reboot. **Off** removes both arguments, including a `disable_cu` you added yourself. The previous file is kept as `cmdline.txt.bak`. **Active CUs** shows the count the driver reported. Only an even split across both shader engines helps performance, so 38 CUs usually scores the same as 36. Some disabled CUs can be faulty, and the pair masked for 38 CUs is always the same one, so it may not avoid them. If you see glitches, try `RADV_DEBUG=nohiz`, then turn this off. If the screen is unusable, remove the arguments over SSH or from another computer.
 - **Apply Now** (experimental): after changing CU Unlock, applies it without a reboot by stopping the display manager, reloading `amdgpu` with the new arguments and starting the display manager again. Steam and any running game close, while Decky keeps running in the background. If the new arguments fail to load, it falls back to the previous ones. It needs `amdgpu` built as a module, systemd and a display manager, and the tab says which one is missing. It runs as the transient unit `ps5-hwcon-cu-reload`, so check `journalctl -u ps5-hwcon-cu-reload` for what happened.
-- **Boot partition**: CU Unlock, GPU Memory and zswap edit files on the FAT partition the console booted from, wherever the distro or desktop mounted it. If it isn't mounted, the plugin mounts it read-only at `/boot/efi` (or `/run/ps5-hwcon/boot` if that's taken), and only makes it writable while saving. It picks the partition whose `cmdline.txt` has the running `root=` argument. If it can't find one, or can't tell which one that is, the GPU or Memory tab shows why.
+- **PS5 Pro**: the GPU tab shows the active CU count. It warns when the count is lower than 60 or dmesg has no `using Viola firmware` line, which means the Viola firmware wasn't loaded, and when dmesg shows `mp1fw_sendmsg: Error : busy` (a kernel whose CPU clock driver is too old). The Pro reads 0 MHz while its GPU is idle, so the clock shows **Idle**. Under Game Fixes, Hide Compute Queue is replaced by `AMD_VIOLA_COMPUTE_QUEUE=0` and `RADV_VIOLA_ML=0` (stock int8 path), saved in `/etc/environment.d/90-ps5-viola.conf`. These only work with a Mesa that has the PS5 Pro patches, and apply after logging out and back in. **Bluetooth Fix** adds `btusb.ps5_ep_resync=1` to `cmdline.txt` for the Pro's MT7925 Bluetooth; only rmuxnet's kernel has that option. **Save GPU Crash Dump** appears when amdgpu has a crash dump and copies it to your home folder. The Pro doesn't recover from GPU faults, and the kernel deletes the dump about 5 minutes after the fault.
+- **Boot partition**: CU Unlock, Thermal Limit, GPU Memory, zswap and the Boot tab edit files on the FAT partition the console booted from, wherever the distro or desktop mounted it. If it isn't mounted, the plugin mounts it read-only at `/boot/efi` (or `/run/ps5-hwcon/boot` if that's taken), and only makes it writable while saving. It picks the partition whose `cmdline.txt` has the running `root=` argument. If it can't find one, or can't tell which one that is, the GPU or Memory tab shows why.
 
 GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ`. The driver isn't part of [ps5-linux-patches](https://github.com/ps5-linux/ps5-linux-patches) itself, so on those kernels the GPU tab shows why it's unavailable and everything else works normally. While the CPU runs at a boost clock (3.3–3.5 GHz), the firmware takes over the GPU clock and holds it at the 2.23 GHz ceiling, regardless of the GPU governor or clock lock.
 
@@ -117,6 +126,14 @@ GPU governors need a kernel built with `CONFIG_PS5_GPUFREQ`. The driver isn't pa
 - **GPU Memory**: **VRAM** writes `vram.txt` on the boot drive, in the hex format the loader expects, and warns if the existing value looks wrong. It's a minimum that stays reserved from system RAM. 6 GB is the recommended choice for gaming. Pick 512 MB if you don't game, or set any size from 256 MB to 12 GB with **Custom Size**. **GTT Limit** sets `ttm.pages_limit` in `cmdline.txt`, which raises how much system RAM the GPU can use without reserving it, so try this if a game runs out of memory. Both need a reboot. See the [wiki](https://wiki.ps5-linux.eu/post-install/all-distros/#memory-and-swap) for how the two interact.
 - **zram**: turns compressed swap in RAM on or off and sets its size and compression, by writing `/etc/systemd/zram-generator.conf` (the previous file is kept as `.bak`). Needs `zram-generator` and a reboot. Turning it off writes a config without a device, which also masks a distro default.
 - **zswap**: switches zswap on or off immediately and saves `zswap.enabled` in `cmdline.txt`. It only helps with swap on a drive, so leave it off when using zram.
+- **Swap File**: creates a 4, 8 or 16 GB swap file at `/swapfile`, turns it on and adds it to `/etc/fstab` (the previous fstab is kept as `.bak`). On Btrfs it uses `btrfs filesystem mkswapfile`. **Remove Swap File** turns it off, deletes it and takes it out of fstab.
+- **Swappiness**: sets `vm.swappiness` (0–200) now and saves it in `/etc/sysctl.d/90-ps5-hwcon-swappiness.conf`.
+
+### Boot
+
+- **HDMI Link** (upstream kernels): the live FRL rate, whether the 4K 120 Hz link failed, Auto Low Latency Mode and recovery state, read from `/sys/module/hdmi/parameters`. **Retry 4K 120 Hz** tries the fast link again after a failure.
+- **Boot Options**: 1080p Safe Mode (`amdgpu.force_1080p=1`), No 4K at 120 Hz (`hdmi.frl_4k120=0`), No VRR (`hdmi.vrr=0`), Don't Wake the TV (`ps5_cec.one_touch_play=0`) and Front USB-C Display (`usbc_dp.enable=1`). Each one is saved in `cmdline.txt` (the previous file is kept as `.bak`) and needs a reboot. Options the running kernel doesn't have are greyed out.
+- **Warm Reboot** (experimental): restarts Linux with `kexec`, skipping the PS5 OS and the loader. It loads `bzImage`, `initrd.img` and `cmdline.txt` from the boot partition, so `cmdline.txt` changes apply, but a VRAM change still needs a full start with the loader. It needs `kexec-tools` and asks before restarting. On PS5 Bazzite Deck it uses the image's built-in warm reboot (`ps5-kexec`), which also works without `kexec-tools` and keeps the PS5 Pro GPU firmware. While an update is staged, restart normally once instead.
 
 ### LED
 

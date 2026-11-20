@@ -124,6 +124,7 @@ export interface CpuStatusData {
   policy_count: number;
   freq_avg_mhz: number | null;
   freq_peak_mhz: number | null;
+  boost: boolean | null;
   hw_min_mhz: number | null;
   hw_max_mhz: number | null;
   available_mhz: number[];
@@ -136,6 +137,7 @@ export interface CpuSettings {
   restore_on_boot: boolean;
   saved_governor: string | null;
   saved_clock: number | null;
+  saved_boost: boolean | null;
 }
 
 export interface GpuStatusData {
@@ -224,6 +226,86 @@ export interface SwapSettingsData {
   boot_error: string | null;
 }
 
+export interface GpuTempLimitData {
+  supported: boolean;
+  running: number;
+  configured: number | null;
+  pending: boolean;
+  default: number;
+  min: number;
+  max: number;
+  cmdline_path: string | null;
+  boot_error: string | null;
+}
+
+export interface ComputeQueueData {
+  hidden: boolean;
+}
+
+export type BootOptionId = "force_1080p" | "no_4k120" | "no_vrr" | "no_cec_wake" | "usbc_dp" | "idle_halt";
+
+export interface BootOptionState {
+  supported: boolean;
+  configured: boolean | null;
+  running: boolean | null;
+  pending: boolean;
+}
+
+export interface HdmiStatus {
+  frl_rate: string | null;
+  frl_rate_max: string | null;
+  frl_failed: string | null;
+  allm_active: string | null;
+  recovery_status: string | null;
+}
+
+export interface BootOptionsData {
+  options: Record<BootOptionId, BootOptionState>;
+  hdmi: HdmiStatus | null;
+  cmdline_path: string | null;
+  boot_error: string | null;
+}
+
+export interface WarmRebootData {
+  available: boolean;
+  reason: string | null;
+}
+
+export interface SwapFileData {
+  exists: boolean;
+  size: number | null;
+  active: boolean;
+  permanent: boolean;
+  filesystem: string | null;
+  free: number;
+  swappiness: number | null;
+  sizes_gb: number[];
+}
+
+export interface ConsoleData {
+  detected: "pro" | "base" | null;
+  device_id: string | null;
+  source: string | null;
+  pro: boolean;
+}
+
+export interface ProStatusData {
+  active_cus: number | null;
+  viola_firmware: boolean | null;
+  old_kernel: boolean;
+  coredump: string | null;
+  viola_env: Record<string, boolean>;
+}
+
+export interface BtResyncData {
+  supported: boolean;
+  running: boolean;
+  configured: boolean | null;
+  pending: boolean;
+  cmdline_path: string | null;
+  boot_error: string | null;
+}
+
 export interface GovernorInfo {
   label: string;
   description: string;
@@ -245,6 +327,14 @@ export type CuUnlockResult = BackendResult<CuUnlockData>;
 export type GpuMemoryResult = BackendResult<GpuMemoryData>;
 export type MemoryStatusResult = BackendResult<MemoryStatusData>;
 export type SwapSettingsResult = BackendResult<SwapSettingsData>;
+export type GpuTempLimitResult = BackendResult<GpuTempLimitData>;
+export type ComputeQueueResult = BackendResult<ComputeQueueData>;
+export type BootOptionsResult = BackendResult<BootOptionsData>;
+export type WarmRebootResult = BackendResult<WarmRebootData>;
+export type SwapFileResult = BackendResult<SwapFileData>;
+export type ConsoleResult = BackendResult<ConsoleData>;
+export type ProStatusResult = BackendResult<ProStatusData>;
+export type BtResyncResult = BackendResult<BtResyncData>;
 
 export type FanSettingsArgs = [
   restore_on_boot: boolean | null,
@@ -279,6 +369,7 @@ export interface BackendMethods {
   set_cpu_clock: { args: [mhz: number | null]; result: CpuStatusResult };
   get_cpu_settings: { args: []; result: CpuSettingsResult };
   set_cpu_settings: { args: [restore_on_boot: boolean]; result: CpuSettingsResult };
+  set_cpu_boost: { args: [enabled: boolean]; result: CpuStatusResult };
   get_gpu_status: { args: []; result: GpuStatusResult };
   set_gpu_governor: { args: [governor: string]; result: GpuStatusResult };
   set_gpu_clock: { args: [mhz: number | null]; result: GpuStatusResult };
@@ -287,6 +378,25 @@ export interface BackendMethods {
   get_cu_unlock: { args: []; result: CuUnlockResult };
   set_cu_unlock: { args: [target: number]; result: CuUnlockResult };
   reload_cu_unlock: { args: []; result: BackendResult };
+  get_gpu_temp_limit: { args: []; result: GpuTempLimitResult };
+  set_gpu_temp_limit: { args: [celsius: number]; result: GpuTempLimitResult };
+  get_compute_queue: { args: []; result: ComputeQueueResult };
+  set_compute_queue: { args: [hidden: boolean]; result: ComputeQueueResult };
+  get_boot_options: { args: []; result: BootOptionsResult };
+  set_boot_option: { args: [key: BootOptionId, enabled: boolean]; result: BootOptionsResult };
+  retry_hdmi_frl: { args: []; result: BackendResult };
+  get_warm_reboot: { args: []; result: WarmRebootResult };
+  warm_reboot: { args: []; result: BackendResult };
+  get_swap_file: { args: []; result: SwapFileResult };
+  get_console: { args: []; result: ConsoleResult };
+  get_pro_status: { args: []; result: ProStatusResult };
+  save_gpu_coredump: { args: []; result: BackendResult<{ path: string }> };
+  get_bt_resync: { args: []; result: BtResyncResult };
+  set_bt_resync: { args: [enabled: boolean]; result: BtResyncResult };
+  set_viola_env: { args: [name: string, enabled: boolean]; result: ProStatusResult };
+  create_swap_file: { args: [gigabytes: number]; result: SwapFileResult };
+  remove_swap_file: { args: []; result: SwapFileResult };
+  set_swappiness: { args: [value: number]; result: SwapFileResult };
   get_gpu_memory: { args: []; result: GpuMemoryResult };
   set_vram: { args: [megabytes: number]; result: GpuMemoryResult };
   set_gtt_limit: { args: [gigabytes: number | null]; result: GpuMemoryResult };
@@ -301,7 +411,7 @@ export interface BackendMethods {
 
 export type BackendMethod = keyof BackendMethods;
 
-export type TabId = "fan" | "cpu" | "gpu" | "memory" | "led";
+export type TabId = "fan" | "cpu" | "gpu" | "memory" | "led" | "boot";
 
 export interface CuratedPreset {
   id: string;

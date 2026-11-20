@@ -16,6 +16,7 @@ import {
 } from "@decky/ui";
 import { FC, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  FaBolt,
   FaCheck,
   FaCompressArrowsAlt,
   FaCube,
@@ -26,11 +27,13 @@ import {
   FaLock,
   FaMemory,
   FaMicrochip,
+  FaPowerOff,
   FaRedo,
   FaShieldAlt,
   FaSyncAlt,
   FaTachometerAlt,
   FaThermometerHalf,
+  FaTv,
   FaUndo,
   FaUnlock,
   FaWind,
@@ -39,6 +42,10 @@ import {
   BackendMethod,
   BackendMethods,
   BackendResult,
+  BootOptionId,
+  BootOptionsData,
+  BtResyncData,
+  ConsoleData,
   CpuSettings,
   CpuStatusData,
   CuratedPreset,
@@ -57,10 +64,14 @@ import {
   GpuMemoryData,
   GpuSettings,
   GpuStatusData,
+  GpuTempLimitData,
   LedSettingsData,
   MemoryStatusData,
+  ProStatusData,
+  SwapFileData,
   SwapSettingsData,
   TabId,
+  WarmRebootData,
 } from "./types";
 
 const PLUGIN_TITLE = "PS5 Hardware Control";
@@ -159,6 +170,51 @@ const ZRAM_ABOUT =
   "A compressed swap device in RAM. It's fast and doesn't wear out a drive, but the compressed pages still use RAM. Saved in /etc/systemd/zram-generator.conf and applied after a reboot.";
 const ZSWAP_ABOUT =
   "Compresses pages in RAM before they're written to a swap file or partition. It only helps with swap on a drive. With zram it compresses everything twice, so leave it off.";
+const SWAPFILE_ABOUT =
+  "Swap on the drive Linux runs from, at /swapfile. Best on an M.2 or USB SSD: on a USB flash drive it's slow and wears the drive out.";
+const SWAPPINESS_ABOUT = "How readily Linux swaps. Lower keeps more in RAM. With zram, a higher value is normal.";
+const SWAPPINESS_DEFAULT = 60;
+const SWAPPINESS_MAX = 200;
+const BOOST_ABOUT = "Lets the CPU run above its 3.2 GHz base clock under load.";
+const TEMP_LIMIT_ABOUT =
+  "Where the GPU starts slowing down. Lower is cooler but slower. Saved in cmdline.txt and applied after a reboot.";
+const STUTTER_ABOUT = "Removes idle=halt from cmdline.txt. Try it if games micro-stutter. Needs a reboot.";
+const COMPUTE_QUEUE_ABOUT =
+  "Sets AMD_PS5_COMPUTE_QUEUE=0 on the base PS5 and Slim. Try it if one game shows a corrupted picture or hangs. Only matters with PS5 Bazzite Deck's Mesa. Applies after you log out and back in.";
+const PRO_FULL_CUS = 60;
+const PRO_CPU_NOTE = "On the Pro the firmware sets CPU clocks, so these settings may do little.";
+const VRAM_ABOUT_PRO = " On the Pro, try 4 GB if games crash after long sessions.";
+const VIOLA_ENV_CHOICES: { name: string; label: string; description: string }[] = [
+  {
+    name: "AMD_VIOLA_COMPUTE_QUEUE",
+    label: "Hide Compute Queue",
+    description: "Sets AMD_VIOLA_COMPUTE_QUEUE=0, which hides the async compute queue from games. Try it if a game glitches.",
+  },
+  { name: "RADV_VIOLA_ML", label: "Stock int8 Path", description: "Sets RADV_VIOLA_ML=0, which skips the Pro's int8 instructions." },
+];
+const VIOLA_ENV_ABOUT = "Applies after you log out and back in. Needs a Mesa with the Pro patches.";
+const BT_RESYNC_ABOUT = "Adds btusb.ps5_ep_resync=1 to cmdline.txt so the Pro's Bluetooth works. Needs a reboot.";
+const OLD_KERNEL_NOTE = "Its CPU clock driver is too old for the Pro (mp1fw_sendmsg busy). Update the kernel.";
+const COREDUMP_ABOUT =
+  "Left by a GPU fault, which the Pro can't recover from. Saved to your home folder. The kernel deletes it about 5 minutes after the fault.";
+const BOOT_OPTIONS_NOTE =
+  "Saved in cmdline.txt on the boot drive and applied after a reboot. The previous version is kept as cmdline.txt.bak.";
+const DISPLAY_OPTIONS: { id: BootOptionId; label: string; description: string }[] = [
+  { id: "force_1080p", label: "1080p Safe Mode", description: "Only allows 1080p at 60 Hz, to get a picture back. Turn it off afterwards." },
+  { id: "no_4k120", label: "No 4K at 120 Hz", description: "Never offers 4K at 120 Hz. Try it if 4K120 flickers or drops out." },
+  { id: "no_vrr", label: "No VRR", description: "Never offers variable refresh rate." },
+  { id: "no_cec_wake", label: "Don't Wake the TV", description: "Doesn't turn the TV on and switch it to the console at boot." },
+  {
+    id: "usbc_dp",
+    label: "Front USB-C Display",
+    description: "DisplayPort on the front USB-C port, for USB-C displays and the PS VR2. Not with the boot drive in that port.",
+  },
+];
+const WARM_REBOOT_WARNING = [
+  "Restart Linux without going through the PS5 OS and the loader?",
+  "Steam and any running game close without saving. cmdline.txt changes apply, but a VRAM change needs a full start with the loader.",
+  "The warm reboot is experimental: if the console doesn't come back, power it off and start Linux the usual way.",
+];
 
 const STYLES = `
 .ps5hw-grid {
@@ -329,6 +385,7 @@ const TABS: { id: TabId; label: string; icon: JSX.Element }[] = [
   { id: "gpu", label: "GPU", icon: <FaCube /> },
   { id: "memory", label: "RAM", icon: <FaMemory /> },
   { id: "led", label: "LED", icon: <FaLightbulb /> },
+  { id: "boot", label: "Boot", icon: <FaPowerOff /> },
 ];
 
 let lastTab: TabId = "fan";
@@ -1347,6 +1404,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
 
 const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
+  const consoleInfo = useConsole(backend);
   const [status, setStatus] = useState<CpuStatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [applying, setApplying] = useState<string | null>(null);
@@ -1430,6 +1488,21 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     refreshStatus();
   };
 
+  const applyBoost = async (enabled: boolean) => {
+    setApplying("boost");
+    const result = await call("set_cpu_boost", enabled);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setStatus(result.data);
+      setSettings((prev) => (prev ? { ...prev, saved_boost: enabled } : prev));
+    }
+    notify(result);
+    setApplying(null);
+    refreshStatus();
+  };
+
   const saveRestore = async (checked: boolean) => {
     setSavingSettings(true);
     const result = await call("set_cpu_settings", checked);
@@ -1474,14 +1547,20 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const savedParts = [
     settings?.saved_governor != null ? governorInfo(settings.saved_governor, driver).label : null,
     settings?.saved_clock != null ? `the ${formatFreq(settings.saved_clock)} clock lock` : null,
+    settings?.saved_boost != null && status?.boost != null ? `boost ${settings.saved_boost ? "on" : "off"}` : null,
   ].filter(Boolean);
   const restoreDescription = savedParts.length
-    ? `Re-applies ${savedParts.join(" and ")} when Decky starts. The kernel picks its default governor and clock range at boot.`
+    ? `Re-applies ${savedParts.join(", ")} when Decky starts. The kernel picks its default governor and clock range at boot.`
     : "Re-applies your last governor and clock lock when Decky starts. The kernel picks its default governor and clock range at boot.";
 
   return (
     <>
       <PanelSection title="CPU Frequency">
+        {consoleInfo?.pro && (
+          <PanelSectionRow>
+            <div className="ps5hw-note">{PRO_CPU_NOTE}</div>
+          </PanelSectionRow>
+        )}
         <PanelSectionRow>
           <Field
             label="Governor"
@@ -1500,6 +1579,18 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 {status.freq_avg_mhz != null ? formatFreq(status.freq_avg_mhz) : "Unknown"}
               </Field>
             </PanelSectionRow>
+            {status.boost !== null && (
+              <PanelSectionRow>
+                <ToggleField
+                  label="Boost to 3.5 GHz"
+                  icon={<FaBolt />}
+                  description={BOOST_ABOUT}
+                  checked={status.boost}
+                  disabled={busy}
+                  onChange={applyBoost}
+                />
+              </PanelSectionRow>
+            )}
             <PanelSectionRow>
               <Field label="Driver" description={`${status.policy_count} frequency policies`}>
                 {driver ?? "Unknown"}
@@ -1717,6 +1808,561 @@ const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backe
   );
 };
 
+function useBootOptions(backend: ReturnType<typeof useBackend>) {
+  const { call, notify } = backend;
+  const [state, setState] = useState<BootOptionsData | null>(null);
+  const [saving, setSaving] = useState<BootOptionId | null>(null);
+  const alive = useRef<boolean>(true);
+
+  const reload = useCallback(
+    async (quiet: boolean) => {
+      const result = await call("get_boot_options");
+      if (!alive.current) {
+        return;
+      }
+      if (result.success) {
+        setState(result.data);
+      }
+      notify(result, quiet);
+    },
+    [call, notify],
+  );
+
+  useEffect(() => {
+    alive.current = true;
+    reload(true);
+    return () => {
+      alive.current = false;
+    };
+  }, [reload]);
+
+  const save = async (id: BootOptionId, enabled: boolean) => {
+    setSaving(id);
+    const result = await call("set_boot_option", id, enabled);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setState(result.data);
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  return { state, saving, save, reload };
+}
+
+const BootOptionToggle: FC<{
+  options: ReturnType<typeof useBootOptions>;
+  id: BootOptionId;
+  label: string;
+  description: string;
+  inverted?: boolean;
+}> = ({ options, id, label, description, inverted = false }) => {
+  const { state, saving, save } = options;
+  const option = state?.options[id] ?? null;
+  const configured = option?.configured ?? null;
+  const ready = option !== null && state?.cmdline_path != null && saving === null;
+
+  let note: string | null = null;
+  if (option !== null && !option.supported) {
+    note = "Not in this kernel.";
+  } else if (state !== null && state.cmdline_path === null) {
+    note = state.boot_error;
+  } else if (option?.pending) {
+    note = "Reboot to apply.";
+  }
+
+  return (
+    <PanelSectionRow>
+      <ToggleField
+        label={label}
+        description={note ? `${description} ${note}` : description}
+        checked={configured !== null && configured !== inverted}
+        disabled={!ready || (!option?.supported && configured !== true)}
+        onChange={(checked) => save(id, checked !== inverted)}
+      />
+    </PanelSectionRow>
+  );
+};
+
+const GpuTempLimitSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const [state, setState] = useState<GpuTempLimitData | null>(null);
+  const [slider, setSlider] = useState<number | null>(null);
+  const [saving, setSaving] = useState<boolean>(false);
+  const touched = useRef<boolean>(false);
+  const alive = useRef<boolean>(true);
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const result = await call("get_gpu_temp_limit");
+      if (!alive.current) {
+        return;
+      }
+      if (result.success) {
+        setState(result.data);
+      }
+      notify(result, true);
+    })();
+    return () => {
+      alive.current = false;
+    };
+  }, [call, notify]);
+
+  useEffect(() => {
+    if (!touched.current && state !== null) {
+      setSlider(state.configured ?? state.running);
+    }
+  }, [state]);
+
+  const save = async (celsius: number) => {
+    setSaving(true);
+    const result = await call("set_gpu_temp_limit", celsius);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      touched.current = false;
+      setState(result.data);
+    }
+    notify(result);
+    setSaving(false);
+  };
+
+  const confirmSave = (celsius: number) => {
+    if (state === null || celsius <= state.default) {
+      save(celsius);
+      return;
+    }
+    showModal(
+      <ConfirmModal
+        strTitle="Raise the GPU Thermal Limit"
+        strDescription={`Above ${state.default} °C the GPU runs hotter and louder. The old cmdline.txt is kept as cmdline.txt.bak.`}
+        strOKButtonText="Save"
+        bDestructiveWarning
+        onOK={() => save(celsius)}
+      />,
+    );
+  };
+
+  if (state !== null && !state.supported) {
+    return null;
+  }
+
+  const configured = state === null ? null : state.configured ?? state.running;
+  const ready = state?.cmdline_path != null && !saving;
+  let description: string | undefined;
+  if (state !== null && state.cmdline_path === null) {
+    description = state.boot_error ?? undefined;
+  } else if (state?.pending) {
+    description = `${state.configured} °C after a reboot`;
+  }
+
+  return (
+    <PanelSection title="Thermal Limit">
+      <PanelSectionRow>
+        <Field label="Thermal Limit" icon={<FaThermometerHalf />} description={description}>
+          {state === null ? <InlineSpinner /> : formatTemp(state.running)}
+        </Field>
+      </PanelSectionRow>
+      {state !== null && slider !== null && (
+        <>
+          <PanelSectionRow>
+            <SliderField
+              label="Limit"
+              description={TEMP_LIMIT_ABOUT}
+              value={slider}
+              min={state.min}
+              max={state.max}
+              step={1}
+              showValue
+              valueSuffix=" °C"
+              resetValue={state.default}
+              disabled={!ready}
+              onChange={(value) => {
+                touched.current = true;
+                setSlider(value);
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem layout="below" disabled={!ready || slider === configured} onClick={() => confirmSave(slider)}>
+              <ButtonLabel icon={<FaThermometerHalf />} label={`Save ${formatTemp(slider)}`} busy={saving} />
+            </ButtonItem>
+          </PanelSectionRow>
+        </>
+      )}
+    </PanelSection>
+  );
+};
+
+let cachedConsole: ConsoleData | null = null;
+
+function useConsole(backend: ReturnType<typeof useBackend>) {
+  const { call } = backend;
+  const [info, setInfo] = useState<ConsoleData | null>(cachedConsole);
+
+  useEffect(() => {
+    if (cachedConsole !== null) {
+      return;
+    }
+    let alive = true;
+    (async () => {
+      const result = await call("get_console");
+      if (!result.success) {
+        return;
+      }
+      if (result.data.detected !== null) {
+        cachedConsole = result.data;
+      }
+      if (alive) {
+        setInfo(result.data);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [call]);
+
+  return info;
+}
+
+const ProGpuRows: FC<{ backend: ReturnType<typeof useBackend>; status: ProStatusData | null }> = ({
+  backend,
+  status,
+}) => {
+  const { call, notify } = backend;
+  const [saving, setSaving] = useState<boolean>(false);
+  const alive = useRef<boolean>(true);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  const saveDump = async () => {
+    setSaving(true);
+    const result = await call("save_gpu_coredump");
+    if (!alive.current) {
+      return;
+    }
+    notify(result);
+    setSaving(false);
+  };
+
+  const active = status?.active_cus ?? null;
+  let cuDescription: string | undefined;
+  if (status !== null && active === null) {
+    cuDescription = "Not found in dmesg.";
+  } else if (status !== null && active !== null && (active < PRO_FULL_CUS || status.viola_firmware === false)) {
+    cuDescription = "Viola firmware not loaded. Start Linux again (twice after a system update).";
+  }
+
+  return (
+    <>
+      <PanelSectionRow>
+        <Field label="Active CUs" icon={<FaMicrochip />} description={cuDescription}>
+          {status === null ? <InlineSpinner /> : active ?? "Unknown"}
+        </Field>
+      </PanelSectionRow>
+      {status?.old_kernel && (
+        <PanelSectionRow>
+          <Field label="Kernel" icon={<FaExclamationTriangle />} description={OLD_KERNEL_NOTE}>
+            Too old
+          </Field>
+        </PanelSectionRow>
+      )}
+      {status?.coredump && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" description={COREDUMP_ABOUT} disabled={saving} onClick={saveDump}>
+            <ButtonLabel icon={<FaHdd />} label="Save GPU Crash Dump" busy={saving} />
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+    </>
+  );
+};
+
+const GameFixesSection: FC<{
+  backend: ReturnType<typeof useBackend>;
+  console: ConsoleData | null;
+  proStatus: ProStatusData | null;
+  onProStatus: (status: ProStatusData) => void;
+}> = ({ backend, console: consoleInfo, proStatus, onProStatus }) => {
+  const { call, notify } = backend;
+  const bootOptions = useBootOptions(backend);
+  const pro = consoleInfo?.pro === true;
+  const [queueHidden, setQueueHidden] = useState<boolean | null>(null);
+  const [bt, setBt] = useState<BtResyncData | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+  const alive = useRef<boolean>(true);
+
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (consoleInfo === null) {
+      return;
+    }
+    (async () => {
+      if (pro) {
+        const result = await call("get_bt_resync");
+        if (!alive.current) {
+          return;
+        }
+        if (result.success) {
+          setBt(result.data);
+        }
+        notify(result, true);
+      } else {
+        const result = await call("get_compute_queue");
+        if (!alive.current) {
+          return;
+        }
+        if (result.success) {
+          setQueueHidden(result.data.hidden);
+        }
+        notify(result, true);
+      }
+    })();
+  }, [consoleInfo, pro, call, notify]);
+
+  const saveQueue = async (hidden: boolean) => {
+    setSaving("queue");
+    const result = await call("set_compute_queue", hidden);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setQueueHidden(result.data.hidden);
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  const saveViola = async (name: string, enabled: boolean) => {
+    setSaving(name);
+    const result = await call("set_viola_env", name, enabled);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      onProStatus(result.data);
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  const saveBt = async (enabled: boolean) => {
+    setSaving("bt");
+    const result = await call("set_bt_resync", enabled);
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      setBt(result.data);
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  let btNote: string | null = null;
+  if (bt !== null && !bt.supported) {
+    btNote = "Needs rmuxnet's kernel.";
+  } else if (bt !== null && bt.cmdline_path === null) {
+    btNote = bt.boot_error;
+  } else if (bt?.pending) {
+    btNote = "Reboot to apply.";
+  }
+
+  return (
+    <PanelSection title="Game Fixes">
+      <BootOptionToggle
+        options={bootOptions}
+        id="idle_halt"
+        label="Micro-stutter Fix"
+        description={STUTTER_ABOUT}
+        inverted
+      />
+      {consoleInfo !== null && !pro && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Hide Compute Queue"
+            description={COMPUTE_QUEUE_ABOUT}
+            checked={queueHidden ?? false}
+            disabled={queueHidden === null || saving !== null}
+            onChange={saveQueue}
+          />
+        </PanelSectionRow>
+      )}
+      {pro &&
+        VIOLA_ENV_CHOICES.map(({ name, label, description }) => (
+          <PanelSectionRow key={name}>
+            <ToggleField
+              label={label}
+              description={`${description} ${VIOLA_ENV_ABOUT}`}
+              checked={proStatus?.viola_env[name] ?? false}
+              disabled={proStatus === null || saving !== null}
+              onChange={(checked) => saveViola(name, checked)}
+            />
+          </PanelSectionRow>
+        ))}
+      {pro && (
+        <PanelSectionRow>
+          <ToggleField
+            label="Bluetooth Fix"
+            description={btNote ? `${BT_RESYNC_ABOUT} ${btNote}` : BT_RESYNC_ABOUT}
+            checked={bt?.configured ?? false}
+            disabled={bt === null || !bt.supported || bt.cmdline_path === null || saving !== null}
+            onChange={saveBt}
+          />
+        </PanelSectionRow>
+      )}
+    </PanelSection>
+  );
+};
+
+const SwapFileSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const [state, setState] = useState<SwapFileData | null>(null);
+  const [saving, setSaving] = useState<string | null>(null);
+  const [swappiness, setSwappiness] = useState<number>(SWAPPINESS_DEFAULT);
+  const touched = useRef<boolean>(false);
+  const alive = useRef<boolean>(true);
+
+  const apply = (data: SwapFileData) => {
+    setState(data);
+    if (!touched.current && data.swappiness !== null) {
+      setSwappiness(data.swappiness);
+    }
+  };
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const result = await call("get_swap_file");
+      if (!alive.current) {
+        return;
+      }
+      if (result.success) {
+        apply(result.data);
+      }
+      notify(result, true);
+    })();
+    return () => {
+      alive.current = false;
+    };
+  }, [call, notify]);
+
+  const run = async (id: string, request: () => Promise<BackendResult<SwapFileData>>) => {
+    setSaving(id);
+    const result = await request();
+    if (!alive.current) {
+      return;
+    }
+    if (result.success) {
+      touched.current = false;
+      apply(result.data);
+    }
+    notify(result);
+    setSaving(null);
+  };
+
+  const busy = state === null || saving !== null;
+  let value: ReactNode = <InlineSpinner />;
+  let description: string | undefined;
+  if (state?.exists) {
+    value = state.size !== null ? formatUsage(state.size) : "Unknown";
+    description = state.active ? "On" : "Off";
+    if (!state.permanent) {
+      description += " · Not in /etc/fstab, so it won't come back after a reboot";
+    }
+  } else if (state !== null) {
+    value = "None";
+    description = `${formatUsage(state.free)} free on the drive`;
+  }
+
+  return (
+    <PanelSection title="Swap File">
+      <PanelSectionRow>
+        <Field label="Swap File" icon={<FaHdd />} description={description}>
+          {value}
+        </Field>
+      </PanelSectionRow>
+      {state !== null && !state.exists && (
+        <>
+          <PanelSectionRow>
+            <div className="ps5hw-heading">Create</div>
+          </PanelSectionRow>
+          <ButtonGrid columns={state.sizes_gb.length}>
+            {state.sizes_gb.map((gigabytes) => {
+              const id = `create-${gigabytes}`;
+              return (
+                <DialogButton
+                  key={id}
+                  className="ps5hw-btn"
+                  disabled={busy || state.free <= (gigabytes + 1) * GIB}
+                  onClick={() => run(id, () => call("create_swap_file", gigabytes))}
+                >
+                  <ChoiceLabel label={`${gigabytes} GB`} busy={saving === id} />
+                </DialogButton>
+              );
+            })}
+          </ButtonGrid>
+        </>
+      )}
+      {state?.exists && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={busy} onClick={() => run("remove", () => call("remove_swap_file"))}>
+            <ButtonLabel icon={<FaUndo />} label="Remove Swap File" busy={saving === "remove"} />
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+      <PanelSectionRow>
+        <div className="ps5hw-note">{SWAPFILE_ABOUT}</div>
+      </PanelSectionRow>
+      {state?.swappiness != null && (
+        <>
+          <PanelSectionRow>
+            <SliderField
+              label="Swappiness"
+              description={SWAPPINESS_ABOUT}
+              value={swappiness}
+              min={0}
+              max={SWAPPINESS_MAX}
+              step={1}
+              showValue
+              resetValue={SWAPPINESS_DEFAULT}
+              disabled={busy}
+              onChange={(next) => {
+                touched.current = true;
+                setSwappiness(next);
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <ButtonItem
+              layout="below"
+              disabled={busy || swappiness === state.swappiness}
+              onClick={() => run("swappiness", () => call("set_swappiness", swappiness))}
+            >
+              <ButtonLabel icon={<FaCheck />} label={`Set Swappiness to ${swappiness}`} busy={saving === "swappiness"} />
+            </ButtonItem>
+          </PanelSectionRow>
+        </>
+      )}
+    </PanelSection>
+  );
+};
+
 const vramDescription = (memory: GpuMemoryData) => {
   const running = memory.vram_running;
   const configured = memory.vram_configured;
@@ -1761,6 +2407,7 @@ const customVramStart = (configured: number | null) => {
 
 const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
+  const consoleInfo = useConsole(backend);
   const [memory, setMemory] = useState<GpuMemoryData | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
   const [custom, setCustom] = useState<number>(RECOMMENDED_VRAM_MB);
@@ -1875,7 +2522,7 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
         </ButtonItem>
       </PanelSectionRow>
       <PanelSectionRow>
-        <div className="ps5hw-note">{VRAM_ABOUT}</div>
+        <div className="ps5hw-note">{consoleInfo?.pro ? VRAM_ABOUT + VRAM_ABOUT_PRO : VRAM_ABOUT}</div>
       </PanelSectionRow>
       <PanelSectionRow>
         <Field
@@ -2200,12 +2847,16 @@ const MemoryTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) 
           />
         </PanelSectionRow>
       </PanelSection>
+      <SwapFileSection backend={backend} />
     </>
   );
 };
 
 const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
   const { call, notify } = backend;
+  const consoleInfo = useConsole(backend);
+  const pro = consoleInfo?.pro === true;
+  const [proStatus, setProStatus] = useState<ProStatusData | null>(null);
   const [status, setStatus] = useState<GpuStatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [applying, setApplying] = useState<string | null>(null);
@@ -2258,6 +2909,26 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
       window.clearInterval(timer);
     };
   }, [refreshStatus, call, notify]);
+
+  useEffect(() => {
+    if (!pro) {
+      return;
+    }
+    let active = true;
+    (async () => {
+      const result = await call("get_pro_status");
+      if (!active) {
+        return;
+      }
+      if (result.success) {
+        setProStatus(result.data);
+      }
+      notify(result, true);
+    })();
+    return () => {
+      active = false;
+    };
+  }, [pro, call, notify]);
 
   const applyGovernor = async (governor: string) => {
     setApplying(governor);
@@ -2346,7 +3017,11 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           <>
             <PanelSectionRow>
               <Field label="Clock" icon={<FaCube />} description={freqDescription || undefined}>
-                {status.freq_mhz != null ? formatFreq(status.freq_mhz) : "Unknown"}
+                {status.freq_mhz != null && (status.freq_mhz > 0 || !pro)
+                  ? formatFreq(status.freq_mhz)
+                  : pro
+                    ? "Idle"
+                    : "Unknown"}
               </Field>
             </PanelSectionRow>
             <PanelSectionRow>
@@ -2354,6 +3029,7 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
             </PanelSectionRow>
           </>
         )}
+        {pro && <ProGpuRows backend={backend} status={proStatus} />}
       </PanelSection>
       {governors.length > 0 && (
         <PanelSection title={`Governors (${governors.length})`}>
@@ -2406,7 +3082,9 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           />
         </PanelSectionRow>
       </PanelSection>
-      <CuUnlockSection backend={backend} />
+      <GpuTempLimitSection backend={backend} />
+      {consoleInfo !== null && !pro && <CuUnlockSection backend={backend} />}
+      <GameFixesSection backend={backend} console={consoleInfo} proStatus={proStatus} onProStatus={setProStatus} />
     </>
   );
 };
@@ -2652,6 +3330,129 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   );
 };
 
+const sysfsYes = (value: string | null) => value !== null && ["Y", "1"].includes(value.trim().toUpperCase());
+
+const BootTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+  const { call, notify } = backend;
+  const bootOptions = useBootOptions(backend);
+  const [warm, setWarm] = useState<WarmRebootData | null>(null);
+  const [busy, setBusy] = useState<"retry" | "reboot" | null>(null);
+  const alive = useRef<boolean>(true);
+
+  useEffect(() => {
+    alive.current = true;
+    (async () => {
+      const result = await call("get_warm_reboot");
+      if (!alive.current) {
+        return;
+      }
+      if (result.success) {
+        setWarm(result.data);
+      }
+      notify(result, true);
+    })();
+    return () => {
+      alive.current = false;
+    };
+  }, [call, notify]);
+
+  const retry = async () => {
+    setBusy("retry");
+    const result = await call("retry_hdmi_frl");
+    if (!alive.current) {
+      return;
+    }
+    notify(result);
+    setBusy(null);
+    bootOptions.reload(true);
+  };
+
+  const reboot = async () => {
+    setBusy("reboot");
+    const result = await call("warm_reboot");
+    if (!alive.current) {
+      return;
+    }
+    notify(result);
+    setBusy(null);
+  };
+
+  const confirmReboot = () =>
+    showModal(
+      <ConfirmModal
+        strTitle="Warm Reboot"
+        strDescription={
+          <>
+            {WARM_REBOOT_WARNING.map((paragraph) => (
+              <p key={paragraph}>{paragraph}</p>
+            ))}
+          </>
+        }
+        strOKButtonText="Restart"
+        bDestructiveWarning
+        onOK={reboot}
+      />,
+    );
+
+  const hdmi = bootOptions.state?.hdmi ?? null;
+  const failed = hdmi !== null && sysfsYes(hdmi.frl_failed);
+
+  return (
+    <>
+      {hdmi !== null && (
+        <PanelSection title="HDMI Link">
+          <PanelSectionRow>
+            <Field
+              label="4K 120 Hz Link"
+              icon={<FaTv />}
+              description={`FRL rate ${hdmi.frl_rate ?? "?"} of ${hdmi.frl_rate_max ?? "?"} · Auto low latency ${
+                sysfsYes(hdmi.allm_active) ? "on" : "off"
+              } · Recovery ${hdmi.recovery_status ?? "unknown"}`}
+            >
+              {failed ? "Failed" : "OK"}
+            </Field>
+          </PanelSectionRow>
+          {failed && (
+            <PanelSectionRow>
+              <ButtonItem
+                layout="below"
+                description="The TV fell back to a slower link."
+                disabled={busy !== null}
+                onClick={retry}
+              >
+                <ButtonLabel icon={<FaRedo />} label="Retry 4K 120 Hz" busy={busy === "retry"} />
+              </ButtonItem>
+            </PanelSectionRow>
+          )}
+        </PanelSection>
+      )}
+      <PanelSection title="Boot Options">
+        {DISPLAY_OPTIONS.map(({ id, label, description }) => (
+          <BootOptionToggle key={id} options={bootOptions} id={id} label={label} description={description} />
+        ))}
+        <PanelSectionRow>
+          <div className="ps5hw-note">{BOOT_OPTIONS_NOTE}</div>
+        </PanelSectionRow>
+      </PanelSection>
+      <PanelSection title="Warm Reboot">
+        <PanelSectionRow>
+          <ButtonItem
+            layout="below"
+            description={
+              warm?.reason ??
+              "Restarts Linux with kexec, skipping the PS5 OS and the loader. Experimental."
+            }
+            disabled={!warm?.available || busy !== null}
+            onClick={confirmReboot}
+          >
+            <ButtonLabel icon={<FaPowerOff />} label="Warm Reboot" busy={busy === "reboot"} />
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    </>
+  );
+};
+
 const Content: FC = () => {
   const backend = useBackend();
   const [tab, setTab] = useState<TabId>(lastTab);
@@ -2672,6 +3473,7 @@ const Content: FC = () => {
       {tab === "gpu" && <GpuTab backend={backend} />}
       {tab === "memory" && <MemoryTab backend={backend} />}
       {tab === "led" && <LedTab backend={backend} />}
+      {tab === "boot" && <BootTab backend={backend} />}
     </>
   );
 };
