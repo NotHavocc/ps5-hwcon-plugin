@@ -14,7 +14,15 @@ import {
   TextField,
   ToggleField,
 } from "@decky/ui";
-import { FC, ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  FC,
+  ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   FaBolt,
   FaCheck,
@@ -73,6 +81,7 @@ import {
   TabId,
   WarmRebootData,
 } from "./types";
+import { t } from "./i18n";
 
 const PLUGIN_TITLE = "PS5 Hardware Control";
 const FAN_MIN = 40;
@@ -99,7 +108,12 @@ const FAN_PWM_MAX = 255;
 const FAN_MODE_FULL = 0;
 const FAN_MODE_CURVE = 2;
 const FAN_MODE_FIRMWARE = 3;
-const FAN_MODE_LABELS: Record<number, string> = { [FAN_MODE_FULL]: "Full Speed", 1: "Manual", [FAN_MODE_CURVE]: "Curve", [FAN_MODE_FIRMWARE]: "Console Firmware" };
+const FAN_MODE_LABELS: Record<number, string> = {
+  [FAN_MODE_FULL]: t("Full Speed"),
+  1: t("Manual"),
+  [FAN_MODE_CURVE]: t("Curve"),
+  [FAN_MODE_FIRMWARE]: t("Console Firmware"),
+};
 const FAN_QUIET_TEMPS = [50, 60, 65, 70, 75, 80, 85, 87];
 const FAN_QUIET_STOP = 45;
 const FULL_SPEED_ID = "full";
@@ -109,7 +123,7 @@ const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
 const TOO_SMALL_VRAM = 256 * MIB;
 const CU_CHOICES: { target: number; label: string }[] = [
-  { target: 0, label: "Off" },
+  { target: 0, label: t("Off") },
   { target: 38, label: "38 CUs" },
   { target: 40, label: "40 CUs" },
 ];
@@ -118,18 +132,18 @@ const CU_ARGUMENTS: Record<number, string> = {
   40: "amdgpu.ps5_cu_unlock=3",
 };
 const CU_UNLOCK_MODES: Record<number, string> = {
-  0: "Off",
-  1: "Probe only",
-  2: "First shader array only",
-  3: "All CUs",
-  4: "Probe only",
+  0: t("Off"),
+  1: t("Probe only"),
+  2: t("First shader array only"),
+  3: t("All CUs"),
+  4: t("Probe only"),
 };
 const CU_UNLOCK_ABOUT =
-  "Turns on the CUs disabled at the factory, which only happens at boot, so this edits cmdline.txt on your boot drive. Consoles have 36 or 38 active CUs out of 40. If games glitch, try RADV_DEBUG=nohiz, or turn this off.";
+  t("Turns on the CUs disabled at the factory, which only happens at boot, so this edits cmdline.txt on your boot drive. Consoles have 36 or 38 active CUs out of 40. If games glitch, try RADV_DEBUG=nohiz, or turn this off.");
 const CU_RELOAD_WARNING = [
   "This applies the change now by reloading the GPU driver, but it's VERY experimental.",
   "The display manager restarts, so Steam and any running game close. Save your progress first. Decky keeps running, so Thermal Guard and LED loops carry on.",
-  "If the screen stays black, restart the console. The change stays in cmdline.txt, so if the black screen comes back, remove it over SSH or from another computer.",
+  "If the screen stays black, restart the console. The change stays in cmdline.txt, so if the screen stays black after rebooting, remove the option over SSH or from another computer.",
 ];
 const RECOMMENDED_VRAM_MB = 6 * 1024;
 const CUSTOM_VRAM_MIN_MB = 256;
@@ -140,11 +154,11 @@ const VRAM_CHOICES: { megabytes: number; label: string; subtitle?: string }[] = 
   { megabytes: 1024, label: "1 GB" },
   { megabytes: 2048, label: "2 GB" },
   { megabytes: 4096, label: "4 GB" },
-  { megabytes: RECOMMENDED_VRAM_MB, label: "6 GB", subtitle: "Recommended" },
+  { megabytes: RECOMMENDED_VRAM_MB, label: "6 GB", subtitle: t("Recommended") },
   { megabytes: 8192, label: "8 GB" },
 ];
 const GTT_CHOICES: { gigabytes: number | null; label: string }[] = [
-  { gigabytes: null, label: "Default" },
+  { gigabytes: null, label: t("Default") },
   { gigabytes: 10, label: "10 GB" },
   { gigabytes: 12, label: "12 GB" },
 ];
@@ -162,10 +176,6 @@ const DEFAULT_ZRAM_SIZE = "ram / 2";
 const DEFAULT_ZRAM_ALGORITHM = "zstd";
 const MEMORY_ABOUT =
   "The CPU and GPU share one 16 GB pool, about 14 GB of it usable by Linux. Memory given to the GPU is taken from everything else.";
-const VRAM_ABOUT =
-  "Memory reserved for the GPU all the time, taken from system RAM. 6 GB is the usual choice for gaming. Needs a reboot.";
-const GTT_ABOUT =
-  "How much system RAM the GPU can use on top of that. If a game runs out of memory, raise this first, because the RAM stays free when you aren't gaming. Needs a reboot.";
 const ZRAM_ABOUT =
   "A compressed swap device in RAM. It's fast and doesn't wear out a drive, but the compressed pages still use RAM. Saved in /etc/systemd/zram-generator.conf and applied after a reboot.";
 const ZSWAP_ABOUT =
@@ -215,6 +225,9 @@ const WARM_REBOOT_WARNING = [
   "Steam and any running game close without saving. cmdline.txt changes apply, but a VRAM change needs a full start with the loader.",
   "The warm reboot is experimental: if the console doesn't come back, power it off and start Linux the usual way.",
 ];
+const VRAM_ABOUT = t("Memory reserved for the GPU all the time, taken from system RAM.");
+const GTT_ABOUT =
+  t("How much system RAM the GPU can use on top of that. If a game runs out of memory, raise this first, because the RAM stays free when you aren't gaming.");
 
 const STYLES = `
 .ps5hw-grid {
@@ -306,15 +319,16 @@ const STYLES = `
 `;
 
 const FAN_PRESETS: FanPreset[] = [
-  { id: "quiet", label: "Quiet", temp: 85 },
-  { id: "default", label: "Default", temp: FAN_BOOT_TARGET },
-  { id: "balanced", label: "Balanced", temp: 72 },
-  { id: "cool", label: "Cool", temp: 65 },
-  { id: "max", label: "Max Cooling", temp: FAN_MAX_COOLING },
+  { id: "quiet", label: t("Quiet"), temp: 85 },
+  { id: "default", label: t("Default"), temp: FAN_BOOT_TARGET },
+  { id: "balanced", label: t("Balanced"), temp: 72 },
+  { id: "cool", label: t("Cool"), temp: 65 },
+  { id: "max", label: t("Max Cooling"), temp: FAN_MAX_COOLING },
 ];
 
 const pwmToPercent = (pwm: number) => Math.round((pwm * 100) / FAN_PWM_MAX);
-const percentToPwm = (percent: number) => Math.round((percent * FAN_PWM_MAX) / 100);
+const percentToPwm = (percent: number) =>
+  Math.round((percent * FAN_PWM_MAX) / 100);
 
 const makeCurve = (stop: number, points: [number, number][]): FanCurve => ({
   stop,
@@ -322,65 +336,91 @@ const makeCurve = (stop: number, points: [number, number][]): FanCurve => ({
 });
 
 const FAN_CURVE_PRESETS: FanCurvePreset[] = [
-  { id: "quiet", label: "Quiet", subtitle: "Kernel default", curve: null },
+  {
+    id: "quiet",
+    label: t("Quiet"),
+    subtitle: t("Kernel default"),
+    curve: null,
+  },
   {
     id: "balanced",
-    label: "Balanced",
-    subtitle: "100% at 85 °C",
-    curve: makeCurve(40, [[45, 15], [55, 25], [60, 35], [65, 45], [70, 60], [75, 75], [80, 90], [85, 100]]),
+    label: t("Balanced"),
+    subtitle: t("100% at {{temperature}} °C", { temperature: 85 }),
+    curve: makeCurve(40, [
+      [45, 15],
+      [55, 25],
+      [60, 35],
+      [65, 45],
+      [70, 60],
+      [75, 75],
+      [80, 90],
+      [85, 100],
+    ]),
   },
   {
     id: "cool",
-    label: "Cool",
-    subtitle: "100% at 80 °C",
-    curve: makeCurve(35, [[40, 20], [50, 30], [55, 40], [60, 50], [65, 65], [70, 80], [75, 90], [80, 100]]),
+    label: t("Cool"),
+    subtitle: t("100% at {{temperature}} °C", { temperature: 80 }),
+    curve: makeCurve(35, [
+      [40, 20],
+      [50, 30],
+      [55, 40],
+      [60, 50],
+      [65, 65],
+      [70, 80],
+      [75, 90],
+      [80, 100],
+    ]),
   },
 ];
 
 const FULL_SPEED_PRESET: FanCurvePreset = {
   id: FULL_SPEED_ID,
-  label: "Full Speed",
-  subtitle: "Ignores the curve",
+  label: t("Full Speed"),
+  subtitle: t("Ignores the curve"),
   curve: null,
 };
 
 const FAN_VIEWS: { id: FanView; label: string; description: string }[] = [
-  { id: "target", label: "Target", description: "Hold a temperature" },
-  { id: "curve", label: "Curve", description: "Speed per temperature" },
+  { id: "target", label: t("Target"), description: t("Hold a temperature") },
+  { id: "curve", label: t("Curve"), description: t("Speed per temperature") },
 ];
 
 const CURATED_PRESETS: CuratedPreset[] = [
-  { id: "off", label: "Off" },
-  { id: "white_bright", label: "White Bright" },
-  { id: "blue_rich", label: "Blue Rich" },
-  { id: "purple", label: "Purple" },
-  { id: "orange_breathe", label: "Orange Breathe" },
-  { id: "pink_breathe", label: "Pink Breathe" },
+  { id: "off", label: t("Off") },
+  { id: "white_bright", label: t("White Bright") },
+  { id: "blue_rich", label: t("Blue Rich") },
+  { id: "purple", label: t("Purple") },
+  { id: "orange_breathe", label: t("Orange Breathe") },
+  { id: "pink_breathe", label: t("Pink Breathe") },
 ];
 
 const GOVERNORS: Record<string, GovernorInfo> = {
-  performance: { label: "Performance", description: "Highest clocks" },
-  powersave: { label: "Powersave", description: "Lowest clocks" },
-  schedutil: { label: "Schedutil", description: "Follows scheduler load" },
-  ondemand: { label: "Ondemand", description: "Jumps up under load" },
-  conservative: { label: "Conservative", description: "Ramps up gradually" },
-  userspace: { label: "Userspace", description: "Speed set by a program" },
+  performance: { label: t("Performance"), description: t("Highest clocks") },
+  powersave: { label: t("Powersave"), description: t("Lowest clocks") },
+  schedutil: { label: "Schedutil", description: t("Follows scheduler load") },
+  ondemand: { label: "Ondemand", description: t("Jumps up under load") },
+  conservative: { label: "Conservative", description: t("Ramps up gradually") },
+  userspace: { label: "Userspace", description: t("Speed set by a program") },
 };
 
 const EPP_GOVERNORS: Record<string, GovernorInfo> = {
-  performance: { label: "Performance", description: "Biased to max clocks" },
-  powersave: { label: "Powersave", description: "Firmware managed" },
+  performance: {
+    label: t("Performance"),
+    description: t("Biased to max clocks"),
+  },
+  powersave: { label: t("Powersave"), description: t("Firmware managed") },
 };
 
 const GPU_GOVERNORS: Record<string, GovernorInfo> = {
-  simple_ondemand: { label: "Ondemand", description: "Follows GPU load" },
-  performance: { label: "Performance", description: "Highest clock" },
-  powersave: { label: "Powersave", description: "Lowest clock" },
-  userspace: { label: "Userspace", description: "Clock set by a program" },
+  simple_ondemand: { label: "Ondemand", description: t("Follows GPU load") },
+  performance: { label: t("Performance"), description: t("Highest clock") },
+  powersave: { label: t("Powersave"), description: t("Lowest clock") },
+  userspace: { label: "Userspace", description: t("Clock set by a program") },
 };
 
 const TABS: { id: TabId; label: string; icon: JSX.Element }[] = [
-  { id: "fan", label: "Fan", icon: <FaWind /> },
+  { id: "fan", label: t("Fan"), icon: <FaWind /> },
   { id: "cpu", label: "CPU", icon: <FaTachometerAlt /> },
   { id: "gpu", label: "GPU", icon: <FaCube /> },
   { id: "memory", label: "RAM", icon: <FaMemory /> },
@@ -392,7 +432,8 @@ let lastTab: TabId = "fan";
 let lastFanView: FanView | null = null;
 let lastCurveHandle = 1;
 
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, value));
 
 const chunk = <T,>(items: T[], size: number): T[][] => {
   const rows: T[][] = [];
@@ -425,18 +466,25 @@ const formatUsage = (size: number) =>
   size >= GIB ? `${(size / GIB).toFixed(1)} GB` : `${Math.floor(size / MIB)} MB`;
 
 const fanModeLabel = (mode: number | null) =>
-  mode === null ? "Unknown" : FAN_MODE_LABELS[mode] ?? `Mode ${mode}`;
+  mode === null
+    ? t("Unknown")
+    : (FAN_MODE_LABELS[mode] ?? t("Mode {{mode}}", { mode }));
 
 const curvesEqual = (a: FanCurve, b: FanCurve) =>
   a.stop === b.stop &&
   a.points.length === b.points.length &&
-  a.points.every(([temp, pwm], i) => temp === b.points[i][0] && pwm === b.points[i][1]);
+  a.points.every(
+    ([temp, pwm], i) => temp === b.points[i][0] && pwm === b.points[i][1],
+  );
 
 const curvePresetId = (curve: FanCurve) => {
   for (const preset of FAN_CURVE_PRESETS) {
     if (preset.curve === null) {
       const temps = curve.points.map(([temp]) => temp);
-      if (curve.stop === FAN_QUIET_STOP && temps.join() === FAN_QUIET_TEMPS.join()) {
+      if (
+        curve.stop === FAN_QUIET_STOP &&
+        temps.join() === FAN_QUIET_TEMPS.join()
+      ) {
         return preset.id;
       }
     } else if (curvesEqual(curve, preset.curve)) {
@@ -449,7 +497,12 @@ const curvePresetId = (curve: FanCurve) => {
 const handleBounds = (curve: FanCurve, handle: number) => {
   const { points, stop } = curve;
   if (handle === STOP_HANDLE) {
-    return { tempLow: Math.min(FAN_CURVE_TEMP_MIN, stop), tempHigh: points[0][0] - 1, pwmLow: 0, pwmHigh: 0 };
+    return {
+      tempLow: Math.min(FAN_CURVE_TEMP_MIN, stop),
+      tempHigh: points[0][0] - 1,
+      pwmLow: 0,
+      pwmHigh: 0,
+    };
   }
   const index = handle - 1;
   const last = points.length - 1;
@@ -461,7 +514,12 @@ const handleBounds = (curve: FanCurve, handle: number) => {
   };
 };
 
-const moveHandle = (curve: FanCurve, handle: number, temp: number, percent: number): FanCurve | null => {
+const moveHandle = (
+  curve: FanCurve,
+  handle: number,
+  temp: number,
+  percent: number,
+): FanCurve | null => {
   const bounds = handleBounds(curve, handle);
   const nextTemp = clamp(temp, bounds.tempLow, bounds.tempHigh);
   if (handle === STOP_HANDLE) {
@@ -469,11 +527,15 @@ const moveHandle = (curve: FanCurve, handle: number, temp: number, percent: numb
   }
   const [oldTemp, oldPwm] = curve.points[handle - 1];
   const nextPwm =
-    pwmToPercent(oldPwm) === percent ? oldPwm : clamp(percentToPwm(percent), bounds.pwmLow, bounds.pwmHigh);
+    pwmToPercent(oldPwm) === percent
+      ? oldPwm
+      : clamp(percentToPwm(percent), bounds.pwmLow, bounds.pwmHigh);
   if (nextTemp === oldTemp && nextPwm === oldPwm) {
     return null;
   }
-  const points = curve.points.map((point, i): [number, number] => (i === handle - 1 ? [nextTemp, nextPwm] : point));
+  const points = curve.points.map((point, i): [number, number] =>
+    i === handle - 1 ? [nextTemp, nextPwm] : point,
+  );
   return { ...curve, points };
 };
 
@@ -482,13 +544,21 @@ const isEppDriver = (driver: string | null) =>
 
 const governorInfo = (id: string, driver: string | null): GovernorInfo =>
   (isEppDriver(driver) ? EPP_GOVERNORS[id] : undefined) ??
-  GOVERNORS[id] ?? { label: prettifyPreset(id), description: "Kernel governor" };
+  GOVERNORS[id] ?? {
+    label: prettifyPreset(id),
+    description: t("Kernel governor"),
+  };
 
 const gpuGovernorInfo = (id: string): GovernorInfo =>
-  GPU_GOVERNORS[id] ?? { label: prettifyPreset(id), description: "Kernel governor" };
+  GPU_GOVERNORS[id] ?? {
+    label: prettifyPreset(id),
+    description: t("Kernel governor"),
+  };
 
 const InlineSpinner: FC = () => (
-  <Spinner style={{ width: "1.2em", height: "1.2em", verticalAlign: "middle" }} />
+  <Spinner
+    style={{ width: "1.2em", height: "1.2em", verticalAlign: "middle" }}
+  />
 );
 
 const ButtonLabel: FC<{ icon: JSX.Element; label: string; busy?: boolean }> = ({
@@ -502,11 +572,11 @@ const ButtonLabel: FC<{ icon: JSX.Element; label: string; busy?: boolean }> = ({
   </div>
 );
 
-const ButtonGrid: FC<{ columns: number; className?: string; children: ReactNode }> = ({
-  columns,
-  className,
-  children,
-}) => (
+const ButtonGrid: FC<{
+  columns: number;
+  className?: string;
+  children: ReactNode;
+}> = ({ columns, className, children }) => (
   <PanelSectionRow>
     <Focusable
       flow-children="horizontal"
@@ -519,10 +589,16 @@ const ButtonGrid: FC<{ columns: number; className?: string; children: ReactNode 
 );
 
 const gridButtonClass = (index: number, count: number, columns: number) =>
-  index === count - 1 && count % columns !== 0 ? "ps5hw-btn ps5hw-wide" : "ps5hw-btn";
+  index === count - 1 && count % columns !== 0
+    ? "ps5hw-btn ps5hw-wide"
+    : "ps5hw-btn";
 
 const nearest = (value: number, choices: number[]) =>
-  choices.reduce((best, choice) => (Math.abs(choice - value) < Math.abs(best - value) ? choice : best), value);
+  choices.reduce(
+    (best, choice) =>
+      Math.abs(choice - value) < Math.abs(best - value) ? choice : best,
+    value,
+  );
 
 const gcd = (a: number, b: number): number => (b === 0 ? a : gcd(b, a % b));
 
@@ -536,7 +612,17 @@ const ClockLockSection: FC<{
   busy: boolean;
   applying: string | null;
   onApply: (mhz: number | null) => Promise<void>;
-}> = ({ description, hwMin, hwMax, steps, fallbackStep, locked, busy, applying, onApply }) => {
+}> = ({
+  description,
+  hwMin,
+  hwMax,
+  steps,
+  fallbackStep,
+  locked,
+  busy,
+  applying,
+  onApply,
+}) => {
   const [slider, setSlider] = useState<number | null>(null);
   const touched = useRef<boolean>(false);
 
@@ -556,18 +642,24 @@ const ClockLockSection: FC<{
   }
 
   const step =
-    steps.length > 1 ? steps.slice(1).reduce((acc, mhz, i) => gcd(acc, mhz - steps[i]), 0) || fallbackStep : fallbackStep;
+    steps.length > 1
+      ? steps.slice(1).reduce((acc, mhz, i) => gcd(acc, mhz - steps[i]), 0) ||
+        fallbackStep
+      : fallbackStep;
 
   return (
-    <PanelSection title="Manual Clock">
+    <PanelSection title={t("Manual Clock")}>
       <PanelSectionRow>
-        <Field label="Clock Lock" icon={locked !== null ? <FaLock /> : <FaUnlock />}>
-          {locked !== null ? formatFreq(locked) : "Automatic"}
+        <Field
+          label={t("Clock Lock")}
+          icon={locked !== null ? <FaLock /> : <FaUnlock />}
+        >
+          {locked !== null ? formatFreq(locked) : t("Automatic")}
         </Field>
       </PanelSectionRow>
       <PanelSectionRow>
         <SliderField
-          label="Clock (MHz)"
+          label={t("Clock (MHz)")}
           description={description}
           value={slider}
           min={hwMin}
@@ -594,14 +686,22 @@ const ClockLockSection: FC<{
           disabled={busy || slider === locked}
           onClick={() => apply(slider)}
         >
-          <ButtonLabel icon={<FaLock />} label="Lock Clock" busy={applying === "clock"} />
+          <ButtonLabel
+            icon={<FaLock />}
+            label={t("Lock Clock")}
+            busy={applying === "clock"}
+          />
         </DialogButton>
         <DialogButton
           className="ps5hw-btn"
           disabled={busy || locked === null}
           onClick={() => apply(null)}
         >
-          <ButtonLabel icon={<FaUnlock />} label="Automatic" busy={applying === "clock-auto"} />
+          <ButtonLabel
+            icon={<FaUnlock />}
+            label={t("Automatic")}
+            busy={applying === "clock-auto"}
+          />
         </DialogButton>
       </ButtonGrid>
     </PanelSection>
@@ -615,12 +715,15 @@ function useBackend() {
       ...args: BackendMethods[M]["args"]
     ): Promise<BackendMethods[M]["result"]> => {
       try {
-        const result = await callBackend<BackendMethods[M]["args"], BackendMethods[M]["result"]>(
-          method,
-          ...args,
-        );
+        const result = await callBackend<
+          BackendMethods[M]["args"],
+          BackendMethods[M]["result"]
+        >(method, ...args);
         if (result === null || typeof result !== "object") {
-          return { success: false, error: `Unexpected response from ${method}` } as BackendMethods[M]["result"];
+          return {
+            success: false,
+            error: `Unexpected response from ${method}`,
+          } as BackendMethods[M]["result"];
         }
         return result;
       } catch (e) {
@@ -651,7 +754,10 @@ function useBackend() {
   return useMemo(() => ({ call, notify }), [call, notify]);
 }
 
-const TabBar: FC<{ active: TabId; onChange: (tab: TabId) => void }> = ({ active, onChange }) => (
+const TabBar: FC<{ active: TabId; onChange: (tab: TabId) => void }> = ({
+  active,
+  onChange,
+}) => (
   <ButtonGrid columns={TABS.length} className="ps5hw-tabs">
     {TABS.map((tab) => {
       const selected = tab.id === active;
@@ -692,16 +798,22 @@ const CurveGraph: FC<{
   const right = GRAPH_LEFT + plotWidth;
   const x = (temp: number) =>
     GRAPH_LEFT +
-    ((clamp(temp, FAN_CURVE_TEMP_MIN, FAN_CURVE_TEMP_MAX) - FAN_CURVE_TEMP_MIN) /
+    ((clamp(temp, FAN_CURVE_TEMP_MIN, FAN_CURVE_TEMP_MAX) -
+      FAN_CURVE_TEMP_MIN) /
       (FAN_CURVE_TEMP_MAX - FAN_CURVE_TEMP_MIN)) *
       plotWidth;
   const y = (percent: number) => bottom - (percent / 100) * plotHeight;
   const color = dimmed ? "#67707b" : ACCENT;
 
-  const points = curve.points.map(([temp, pwm]) => [x(temp), y(pwmToPercent(pwm))] as const);
+  const points = curve.points.map(
+    ([temp, pwm]) => [x(temp), y(pwmToPercent(pwm))] as const,
+  );
   const [firstX, firstY] = points[0];
   const lastY = points[points.length - 1][1];
-  const line = [...points.map(([px, py]) => `${px},${py}`), `${right},${lastY}`].join(" ");
+  const line = [
+    ...points.map(([px, py]) => `${px},${py}`),
+    `${right},${lastY}`,
+  ].join(" ");
   const stopX = x(curve.stop);
 
   const tempTicks: number[] = [];
@@ -715,27 +827,73 @@ const CurveGraph: FC<{
       style={{ width: "100%", height: "auto", display: "block" }}
       fontSize={9}
     >
-      <rect x={GRAPH_LEFT} y={GRAPH_TOP} width={plotWidth} height={plotHeight} fill="rgba(255,255,255,0.04)" />
+      <rect
+        x={GRAPH_LEFT}
+        y={GRAPH_TOP}
+        width={plotWidth}
+        height={plotHeight}
+        fill="rgba(255,255,255,0.04)"
+      />
       {tempTicks.map((temp) => (
         <g key={`t${temp}`}>
-          <line x1={x(temp)} x2={x(temp)} y1={GRAPH_TOP} y2={bottom} stroke="rgba(255,255,255,0.08)" />
-          <text x={x(temp)} y={GRAPH_HEIGHT - 6} fill="#8b929a" textAnchor="middle">
+          <line
+            x1={x(temp)}
+            x2={x(temp)}
+            y1={GRAPH_TOP}
+            y2={bottom}
+            stroke="rgba(255,255,255,0.08)"
+          />
+          <text
+            x={x(temp)}
+            y={GRAPH_HEIGHT - 6}
+            fill="#8b929a"
+            textAnchor="middle"
+          >
             {temp}°
           </text>
         </g>
       ))}
       {[0, 25, 50, 75, 100].map((percent) => (
         <g key={`p${percent}`}>
-          <line x1={GRAPH_LEFT} x2={right} y1={y(percent)} y2={y(percent)} stroke="rgba(255,255,255,0.08)" />
-          <text x={GRAPH_LEFT - 4} y={y(percent) + 3} fill="#8b929a" textAnchor="end">
+          <line
+            x1={GRAPH_LEFT}
+            x2={right}
+            y1={y(percent)}
+            y2={y(percent)}
+            stroke="rgba(255,255,255,0.08)"
+          />
+          <text
+            x={GRAPH_LEFT - 4}
+            y={y(percent) + 3}
+            fill="#8b929a"
+            textAnchor="end"
+          >
             {percent}%
           </text>
         </g>
       ))}
       {}
-      <rect x={stopX} y={GRAPH_TOP} width={Math.max(0, firstX - stopX)} height={plotHeight} fill={color} opacity={0.12} />
-      <path d={`M ${firstX},${bottom} L ${line} L ${right},${bottom} Z`} fill={color} opacity={0.18} />
-      <line x1={firstX} x2={firstX} y1={bottom} y2={firstY} stroke={color} strokeDasharray="3 3" />
+      <rect
+        x={stopX}
+        y={GRAPH_TOP}
+        width={Math.max(0, firstX - stopX)}
+        height={plotHeight}
+        fill={color}
+        opacity={0.12}
+      />
+      <path
+        d={`M ${firstX},${bottom} L ${line} L ${right},${bottom} Z`}
+        fill={color}
+        opacity={0.18}
+      />
+      <line
+        x1={firstX}
+        x2={firstX}
+        y1={bottom}
+        y2={firstY}
+        stroke={color}
+        strokeDasharray="3 3"
+      />
       <polyline points={line} fill="none" stroke={color} strokeWidth={2} />
       {liveTemp !== null && (
         <>
@@ -747,7 +905,14 @@ const CurveGraph: FC<{
             stroke={LIVE_COLOR}
             strokeDasharray="1 3"
           />
-          {livePwm !== null && <circle cx={x(liveTemp)} cy={y(pwmToPercent(livePwm))} r={3.5} fill={LIVE_COLOR} />}
+          {livePwm !== null && (
+            <circle
+              cx={x(liveTemp)}
+              cy={y(pwmToPercent(livePwm))}
+              r={3.5}
+              fill={LIVE_COLOR}
+            />
+          )}
         </>
       )}
       <polygon
@@ -803,12 +968,19 @@ const FanCurveEditor: FC<{
   };
 
   const pointDescription = isStop
-    ? `Fan stops below ${curve.stop} °C`
-    : `Point ${selected}: ${temp} °C → ${percent}%`;
+    ? t("Fan stops below {{temperature}} °C", { temperature: curve.stop })
+    : t("Point {{point}}: {{temperature}} °C → {{percent}}%", {
+        point: selected,
+        temperature: temp,
+        percent,
+      });
 
-  let speedDescription = `Allowed ${pwmToPercent(bounds.pwmLow)}–${pwmToPercent(bounds.pwmHigh)}%`;
+  let speedDescription = t("Allowed {{minimum}}–{{maximum}}%", {
+    minimum: pwmToPercent(bounds.pwmLow),
+    maximum: pwmToPercent(bounds.pwmHigh),
+  });
   if (selected === curve.points.length) {
-    speedDescription = "The last point always runs the fan at full speed.";
+    speedDescription = t("The last point always runs the fan at full speed.");
   }
 
   return (
@@ -829,23 +1001,28 @@ const FanCurveEditor: FC<{
               {" · "}
             </span>
           )}
-          The diamond is where the fan stops. Above {FAN_CURVE_TEMP_MAX} °C the kernel always runs it at full speed.
+          {t(
+            "The diamond is where the fan stops. Above {{temperature}} °C the kernel always runs it at full speed.",
+            { temperature: FAN_CURVE_TEMP_MAX },
+          )}
         </div>
       </PanelSectionRow>
       <PanelSectionRow>
         <SliderField
-          label="Edit Point"
+          label={t("Edit Point")}
           description={pointDescription}
           value={selected}
           min={STOP_HANDLE}
           max={curve.points.length}
           step={1}
           notchCount={curve.points.length + 1}
-          notchLabels={[STOP_HANDLE, ...curve.points.map((_, i) => i + 1)].map((handle) => ({
-            notchIndex: handle,
-            label: handle === STOP_HANDLE ? "Stop" : `${handle}`,
-            value: handle,
-          }))}
+          notchLabels={[STOP_HANDLE, ...curve.points.map((_, i) => i + 1)].map(
+            (handle) => ({
+              notchIndex: handle,
+              label: handle === STOP_HANDLE ? t("Stop") : `${handle}`,
+              value: handle,
+            }),
+          )}
           notchTicksVisible
           disabled={busy}
           onChange={select}
@@ -853,8 +1030,11 @@ const FanCurveEditor: FC<{
       </PanelSectionRow>
       <PanelSectionRow>
         <SliderField
-          label={isStop ? "Stop Temperature" : "Temperature"}
-          description={`Allowed ${bounds.tempLow}–${bounds.tempHigh} °C`}
+          label={isStop ? t("Stop Temperature") : t("Temperature")}
+          description={t("Allowed {{minimum}}–{{maximum}} °C", {
+            minimum: bounds.tempLow,
+            maximum: bounds.tempHigh,
+          })}
           value={temp}
           min={Math.min(FAN_CURVE_TEMP_MIN, temp)}
           max={FAN_CURVE_TEMP_MAX}
@@ -868,7 +1048,7 @@ const FanCurveEditor: FC<{
       {!isStop && (
         <PanelSectionRow>
           <SliderField
-            label="Fan Speed"
+            label={t("Fan Speed")}
             description={speedDescription}
             value={percent}
             min={0}
@@ -882,22 +1062,32 @@ const FanCurveEditor: FC<{
         </PanelSectionRow>
       )}
       <ButtonGrid columns={2}>
-        <DialogButton className="ps5hw-btn" disabled={busy || !edited} onClick={onRevert}>
-          <ButtonLabel icon={<FaUndo />} label="Revert" />
+        <DialogButton
+          className="ps5hw-btn"
+          disabled={busy || !edited}
+          onClick={onRevert}
+        >
+          <ButtonLabel icon={<FaUndo />} label={t("Revert")} />
         </DialogButton>
         <DialogButton
           className="ps5hw-btn"
           disabled={busy || (!edited && fan.mode === FAN_MODE_CURVE)}
           onClick={onApply}
         >
-          <ButtonLabel icon={<FaCheck />} label="Apply Curve" busy={applying === "custom"} />
+          <ButtonLabel
+            icon={<FaCheck />}
+            label={t("Apply Curve")}
+            busy={applying === "custom"}
+          />
         </DialogButton>
       </ButtonGrid>
     </>
   );
 };
 
-const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({
+  backend,
+}) => {
   const { call, notify } = backend;
   const [status, setStatus] = useState<FanStatusData | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -914,30 +1104,31 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const curveTouched = useRef<boolean>(false);
   const thresholdTimer = useRef<number | undefined>(undefined);
 
-  const refreshStatus = useCallback(async (): Promise<FanStatusResult | null> => {
-    if (polling.current) {
-      return null;
-    }
-    polling.current = true;
-    const result = await call("get_fan_status");
-    polling.current = false;
-    if (!alive.current) {
-      return null;
-    }
-    if (result.success) {
-      setStatus(result.data);
-      setStatusError(result.data.fan_error ?? result.data.target_error);
-      if (!sliderTouched.current && result.data.target !== null) {
-        setSlider(clamp(result.data.target, FAN_MIN, FAN_MAX));
+  const refreshStatus =
+    useCallback(async (): Promise<FanStatusResult | null> => {
+      if (polling.current) {
+        return null;
       }
-      if (!curveTouched.current && result.data.fan !== null) {
-        setCurveDraft(result.data.fan.curve);
+      polling.current = true;
+      const result = await call("get_fan_status");
+      polling.current = false;
+      if (!alive.current) {
+        return null;
       }
-    } else {
-      setStatusError(result.error);
-    }
-    return result;
-  }, [call]);
+      if (result.success) {
+        setStatus(result.data);
+        setStatusError(result.data.fan_error ?? result.data.target_error);
+        if (!sliderTouched.current && result.data.target !== null) {
+          setSlider(clamp(result.data.target, FAN_MIN, FAN_MAX));
+        }
+        if (!curveTouched.current && result.data.fan !== null) {
+          setCurveDraft(result.data.fan.curve);
+        }
+      } else {
+        setStatusError(result.error);
+      }
+      return result;
+    }, [call]);
 
   useEffect(() => {
     alive.current = true;
@@ -967,7 +1158,9 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     };
   }, [refreshStatus, call, notify]);
 
-  const mergeFan = (data: { curve?: FanCurve; mode?: number | null } | null) => {
+  const mergeFan = (
+    data: { curve?: FanCurve; mode?: number | null } | null,
+  ) => {
     if (!data) {
       return;
     }
@@ -996,7 +1189,9 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
       return;
     }
     if (result.success) {
-      setStatus((prev) => (prev ? { ...prev, target: result.data.temp } : prev));
+      setStatus((prev) =>
+        prev ? { ...prev, target: result.data.temp } : prev,
+      );
       mergeFan(result.data);
       setSlider(temp);
       sliderTouched.current = false;
@@ -1006,7 +1201,10 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     refreshStatus();
   };
 
-  const runFanUpdate = async (source: string, request: () => Promise<FanUpdateResult>) => {
+  const runFanUpdate = async (
+    source: string,
+    request: () => Promise<FanUpdateResult>,
+  ) => {
     setApplying(source);
     const result = await request();
     if (!alive.current) {
@@ -1021,9 +1219,12 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   };
 
   const applyCurve = (source: string, curve: FanCurve | null) =>
-    runFanUpdate(source, () => (curve === null ? call("reset_fan_curve") : call("set_fan_curve", curve)));
+    runFanUpdate(source, () =>
+      curve === null ? call("reset_fan_curve") : call("set_fan_curve", curve),
+    );
 
-  const applyFullSpeed = () => runFanUpdate(FULL_SPEED_ID, () => call("set_fan_mode", FAN_MODE_FULL));
+  const applyFullSpeed = () =>
+    runFanUpdate(FULL_SPEED_ID, () => call("set_fan_mode", FAN_MODE_FULL));
 
   const applyFirmware = () => runFanUpdate(FIRMWARE_ID, () => call("set_fan_mode", FAN_MODE_FIRMWARE));
 
@@ -1058,7 +1259,9 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     }
     if (result.success) {
       setSettings(result.data.settings);
-      setStatus((prev) => (prev ? { ...prev, guard: result.data.guard } : prev));
+      setStatus((prev) =>
+        prev ? { ...prev, guard: result.data.guard } : prev,
+      );
     }
     notify(result, true);
     setSavingSettings(false);
@@ -1088,11 +1291,11 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     <PanelSectionRow>
       <ButtonItem
         layout="below"
-        description="Hands the fan back to the console's own fan table."
+        description={t("Hands the fan back to the console's own fan table.")}
         disabled={busy || fan === null || fan.mode === FAN_MODE_FIRMWARE}
         onClick={applyFirmware}
       >
-        <ButtonLabel icon={<FaUndo />} label="Return to Console Firmware" busy={applying === FIRMWARE_ID} />
+        <ButtonLabel icon={<FaUndo />} label={t("Return to Console Firmware")} busy={applying === FIRMWARE_ID} />
       </ButtonItem>
     </PanelSectionRow>
   );
@@ -1105,10 +1308,11 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
 
   let viewNote: string | null = null;
   if (status !== null && !curveMode) {
-    viewNote = "Fan curves need a kernel with the ps5_fan hwmon driver.";
+    viewNote = t("Fan curves need a kernel with the ps5_fan hwmon driver.");
   } else if (curveMode && targetView) {
-    viewNote =
-      "This kernel controls the fan by curve, so a target is applied as a curve that reaches full speed just above it. Editing the curve replaces the target.";
+    viewNote = t(
+      "This kernel controls the fan by curve, so a target is applied as a curve that reaches full speed just above it. Editing the curve replaces the target.",
+    );
   }
 
   let selectedCurvePreset: string | null = null;
@@ -1118,48 +1322,69 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     selectedCurvePreset = curvePresetId(fan.curve);
   }
 
-  let targetValue: ReactNode = "Unavailable";
+  let targetValue: ReactNode = t("Unavailable");
   if (loading) {
     targetValue = <InlineSpinner />;
   } else if (target !== null) {
     targetValue = `${target} °C`;
   } else if (fan !== null) {
-    targetValue = "Custom curve";
+    targetValue = t("Custom curve");
   }
 
-  let guardStatus = "Off";
+  let guardStatus = t("Off");
   if (guardEnabled && guard?.active && guard.kind === "curve") {
-    guardStatus = "Cooling · full speed";
+    guardStatus = t("Cooling · full speed");
   } else if (guardEnabled && guard?.active) {
-    guardStatus = `Cooling · restores ${guard.restore_target ?? FAN_BOOT_TARGET} °C`;
+    guardStatus = t("Cooling · restores {{temperature}} °C", {
+      temperature: guard.restore_target ?? FAN_BOOT_TARGET,
+    });
   } else if (alarmEnabled && guard?.alarm_active) {
-    guardStatus = "Overheated · alarm sounded";
+    guardStatus = t("Overheated · alarm sounded");
   } else if (protectionEnabled && guard?.cpu != null) {
-    guardStatus = `Standby · CPU ${formatTemp(guard.cpu)}`;
+    guardStatus = t("Standby · CPU {{temperature}}", {
+      temperature: formatTemp(guard.cpu),
+    });
   } else if (protectionEnabled) {
-    guardStatus = "Standby";
+    guardStatus = t("Standby");
   }
 
   let restoreDescription: string;
   let guardDescription: string;
   if (curveMode) {
-    restoreDescription = `${
-      settings?.saved_curve ? "Re-applies your saved target or fan curve" : "Re-applies the last target or curve you apply"
-    } when Decky starts. The kernel resets the curve to its quiet default at boot.`;
-    guardDescription = `Run the fan at full speed when the CPU reaches the threshold, then go back to the previous mode once it is ${GUARD_HYSTERESIS} °C cooler.`;
+    restoreDescription = settings?.saved_curve
+      ? t(
+          "Re-applies your saved target or fan curve when Decky starts. The kernel resets the curve to its quiet default at boot.",
+        )
+      : t(
+          "Re-applies the last target or curve you apply when Decky starts. The kernel resets the curve to its quiet default at boot.",
+        );
+    guardDescription = t(
+      "Run the fan at full speed when the CPU reaches the threshold, then go back to the previous mode once it is {{degrees}} °C cooler.",
+      { degrees: GUARD_HYSTERESIS },
+    );
   } else {
-    restoreDescription = `${
-      settings?.saved_target != null ? `Re-applies ${settings.saved_target} °C` : "Re-applies your last target"
-    } when Decky starts. The kernel resets the target to ${FAN_BOOT_TARGET} °C at boot.`;
-    guardDescription = `Switch to Max Cooling (${FAN_MAX_COOLING} °C) when the CPU reaches the threshold, then restore your target once it is ${GUARD_HYSTERESIS} °C cooler.`;
+    restoreDescription =
+      settings?.saved_target != null
+        ? t(
+            "Re-applies {{temperature}} °C when Decky starts. The kernel resets the target to {{default}} °C at boot.",
+            { temperature: settings.saved_target, default: FAN_BOOT_TARGET },
+          )
+        : t(
+            "Re-applies your last target when Decky starts. The kernel resets the target to {{default}} °C at boot.",
+            { default: FAN_BOOT_TARGET },
+          );
+    guardDescription = t(
+      "Switch to Max Cooling ({{maximum}} °C) when the CPU reaches the threshold, then restore your target once it is {{degrees}} °C cooler.",
+      { maximum: FAN_MAX_COOLING, degrees: GUARD_HYSTERESIS },
+    );
   }
 
   return (
     <>
-      <PanelSection title="Temperatures">
+      <PanelSection title={t("Temperatures")}>
         {loading && (
           <PanelSectionRow>
-            <Field label="Reading sensors">
+            <Field label={t("Reading sensors")}>
               <InlineSpinner />
             </Field>
           </PanelSectionRow>
@@ -1173,36 +1398,48 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         ))}
         {status !== null && status.sensors.length === 0 && (
           <PanelSectionRow>
-            <Field label="No temperature sensors found" icon={<FaThermometerHalf />} />
+            <Field
+              label={t("No temperature sensors found")}
+              icon={<FaThermometerHalf />}
+            />
           </PanelSectionRow>
         )}
         {curveMode ? (
           <PanelSectionRow>
             <Field
-              label="Fan"
+              label={t("Fan")}
               icon={<FaWind />}
-              description={statusError ?? (fan !== null ? `Mode: ${fanModeLabel(fan.mode)}` : undefined)}
+              description={
+                statusError ??
+                (fan !== null ? `Mode: ${fanModeLabel(fan.mode)}` : undefined)
+              }
             >
-              {fan?.pwm != null ? `${pwmToPercent(fan.pwm)}%` : "Unavailable"}
+              {fan?.pwm != null
+                ? `${pwmToPercent(fan.pwm)}%`
+                : t("Unavailable")}
             </Field>
           </PanelSectionRow>
         ) : (
           <PanelSectionRow>
-            <Field label="Fan Target" icon={<FaWind />} description={statusError ?? undefined}>
+            <Field
+              label={t("Fan Target")}
+              icon={<FaWind />}
+              description={statusError ?? undefined}
+            >
               {targetValue}
             </Field>
           </PanelSectionRow>
         )}
         {(guard?.active || guard?.alarm_active) && (
           <PanelSectionRow>
-            <Field label="Overheat" icon={<FaExclamationTriangle />}>
-              {guard?.active ? "Cooling" : "Alarm sounded"}
+            <Field label={t("Overheat")} icon={<FaExclamationTriangle />}>
+              {guard?.active ? t("Cooling") : t("Alarm sounded")}
             </Field>
           </PanelSectionRow>
         )}
       </PanelSection>
       {status !== null && (
-        <PanelSection title="Fan Control">
+        <PanelSection title={t("Fan Control")}>
           <ButtonGrid columns={2}>
             {FAN_VIEWS.map((option) => (
               <DialogButton
@@ -1210,7 +1447,9 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 className="ps5hw-btn"
                 disabled={busy || (!curveMode && option.id === "curve")}
                 onClick={() => selectView(option.id)}
-                style={{ borderBottom: `2px solid ${activeView === option.id ? ACCENT : "transparent"}` }}
+                style={{
+                  borderBottom: `2px solid ${activeView === option.id ? ACCENT : "transparent"}`,
+                }}
               >
                 <div className="ps5hw-stack">
                   <span>{option.label}</span>
@@ -1228,10 +1467,10 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
       )}
       {targetView && (
         <>
-          <PanelSection title="Presets">
+          <PanelSection title={t("Presets")}>
             {curveMode && (
               <PanelSectionRow>
-                <Field label="Fan Target" icon={<FaWind />}>
+                <Field label={t("Fan Target")} icon={<FaWind />}>
                   {curveOverridden ? fanModeLabel(fan.mode) : targetValue}
                 </Field>
               </PanelSectionRow>
@@ -1243,10 +1482,16 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                   return (
                     <DialogButton
                       key={preset.id}
-                      className={gridButtonClass(rowIndex * 2 + index, FAN_PRESETS.length, 2)}
+                      className={gridButtonClass(
+                        rowIndex * 2 + index,
+                        FAN_PRESETS.length,
+                        2,
+                      )}
                       disabled={busy}
                       onClick={() => applyTarget(preset.id, preset.temp)}
-                      style={{ borderBottom: `2px solid ${selected ? ACCENT : "transparent"}` }}
+                      style={{
+                        borderBottom: `2px solid ${selected ? ACCENT : "transparent"}`,
+                      }}
                     >
                       {applying === preset.id ? (
                         <InlineSpinner />
@@ -1263,11 +1508,13 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
             ))}
             {firmwareButton}
           </PanelSection>
-          <PanelSection title="Manual Target">
+          <PanelSection title={t("Manual Target")}>
             <PanelSectionRow>
               <SliderField
-                label="Target Temperature (°C)"
-                description="Lower targets ramp the fan earlier and louder."
+                label={t("Target Temperature (°C)")}
+                description={t(
+                  "Lower targets ramp the fan earlier and louder.",
+                )}
                 value={slider}
                 min={FAN_MIN}
                 max={FAN_MAX}
@@ -1293,7 +1540,11 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 disabled={busy || loading || (slider === target && !curveOverridden)}
                 onClick={() => applyTarget("manual", slider)}
               >
-                <ButtonLabel icon={<FaWind />} label="Apply Target" busy={applying === "manual"} />
+                <ButtonLabel
+                  icon={<FaWind />}
+                  label={t("Apply Target")}
+                  busy={applying === "manual"}
+                />
               </ButtonItem>
             </PanelSectionRow>
           </PanelSection>
@@ -1301,7 +1552,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
       )}
       {!targetView && (
         <>
-          <PanelSection title="Curve Presets">
+          <PanelSection title={t("Curve Presets")}>
             <ButtonGrid columns={2}>
               {[...FAN_CURVE_PRESETS, FULL_SPEED_PRESET].map((preset) => (
                 <DialogButton
@@ -1309,7 +1560,9 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                   className="ps5hw-btn"
                   disabled={busy || fan === null}
                   onClick={() =>
-                    preset.id === FULL_SPEED_ID ? applyFullSpeed() : applyCurve(preset.id, preset.curve)
+                    preset.id === FULL_SPEED_ID
+                      ? applyFullSpeed()
+                      : applyCurve(preset.id, preset.curve)
                   }
                   style={{
                     borderBottom: `2px solid ${selectedCurvePreset === preset.id ? ACCENT : "transparent"}`,
@@ -1328,7 +1581,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
             </ButtonGrid>
             {firmwareButton}
           </PanelSection>
-          <PanelSection title="Fan Curve">
+          <PanelSection title={t("Fan Curve")}>
             {fan !== null && curveDraft !== null ? (
               <FanCurveEditor
                 curve={curveDraft}
@@ -1341,18 +1594,21 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
               />
             ) : (
               <PanelSectionRow>
-                <Field label="Fan curve" description={statusError ?? undefined}>
-                  {statusError ? "Unavailable" : <InlineSpinner />}
+                <Field
+                  label={t("Fan curve")}
+                  description={statusError ?? undefined}
+                >
+                  {statusError ? t("Unavailable") : <InlineSpinner />}
                 </Field>
               </PanelSectionRow>
             )}
           </PanelSection>
         </>
       )}
-      <PanelSection title="Advanced">
+      <PanelSection title={t("Advanced")}>
         <PanelSectionRow>
           <ToggleField
-            label="Restore on Startup"
+            label={t("Restore on Startup")}
             description={restoreDescription}
             checked={settings?.restore_on_boot ?? false}
             disabled={settings === null || savingSettings}
@@ -1361,7 +1617,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
-            label="Thermal Guard"
+            label={t("Thermal Guard")}
             description={guardDescription}
             checked={guardEnabled}
             disabled={settings === null || savingSettings}
@@ -1370,7 +1626,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSectionRow>
         <PanelSectionRow>
           <ToggleField
-            label="Overheat Alarm"
+            label={t("Overheat Alarm")}
             description={`Play the console's error beep when the CPU reaches the threshold. It re-arms once the CPU is ${GUARD_HYSTERESIS} °C cooler.`}
             checked={alarmEnabled}
             disabled={settings === null || savingSettings}
@@ -1379,8 +1635,10 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSectionRow>
         <PanelSectionRow>
           <SliderField
-            label="Overheat Threshold"
-            description="CPU temperature used by Thermal Guard and Overheat Alarm."
+            label={t("Overheat Threshold")}
+            description={t(
+              "CPU temperature used by Thermal Guard and Overheat Alarm.",
+            )}
             value={threshold}
             min={GUARD_MIN}
             max={GUARD_MAX}
@@ -1393,7 +1651,7 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           />
         </PanelSectionRow>
         <PanelSectionRow>
-          <Field label="Protection Status" icon={<FaShieldAlt />}>
+          <Field label={t("Protection Status")} icon={<FaShieldAlt />}>
             {guardStatus}
           </Field>
         </PanelSectionRow>
@@ -1402,7 +1660,9 @@ const FanTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   );
 };
 
-const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({
+  backend,
+}) => {
   const { call, notify } = backend;
   const consoleInfo = useConsole(backend);
   const [status, setStatus] = useState<CpuStatusData | null>(null);
@@ -1466,7 +1726,9 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     }
     if (result.success) {
       setStatus(result.data);
-      setSettings((prev) => (prev ? { ...prev, saved_governor: governor } : prev));
+      setSettings((prev) =>
+        prev ? { ...prev, saved_governor: governor } : prev,
+      );
     }
     notify(result);
     setApplying(null);
@@ -1481,7 +1743,9 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     }
     if (result.success) {
       setStatus(result.data);
-      setSettings((prev) => (prev ? { ...prev, saved_clock: result.data.locked_mhz } : prev));
+      setSettings((prev) =>
+        prev ? { ...prev, saved_clock: result.data.locked_mhz } : prev,
+      );
     }
     notify(result);
     setApplying(null);
@@ -1523,18 +1787,20 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const current = active.length === 1 ? active[0] : null;
   const busy = applying !== null;
 
-  let governorValue: ReactNode = "Unavailable";
+  let governorValue: ReactNode = t("Unavailable");
   if (loading) {
     governorValue = <InlineSpinner />;
   } else if (current) {
     governorValue = governorInfo(current, driver).label;
   } else if (active.length > 1) {
-    governorValue = "Mixed";
+    governorValue = t("Mixed");
   }
 
   const locked = status?.locked_mhz ?? null;
   const freqDescription = [
-    status?.freq_peak_mhz != null ? `Peak ${formatFreq(status.freq_peak_mhz)}` : null,
+    status?.freq_peak_mhz != null
+      ? `Peak ${formatFreq(status.freq_peak_mhz)}`
+      : null,
     locked !== null
       ? `Locked at ${formatFreq(locked)}`
       : status?.hw_min_mhz != null && status?.hw_max_mhz != null
@@ -1545,28 +1811,35 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     .join(" · ");
 
   const savedParts = [
-    settings?.saved_governor != null ? governorInfo(settings.saved_governor, driver).label : null,
-    settings?.saved_clock != null ? `the ${formatFreq(settings.saved_clock)} clock lock` : null,
-    settings?.saved_boost != null && status?.boost != null ? `boost ${settings.saved_boost ? "on" : "off"}` : null,
+    settings?.saved_governor != null
+      ? governorInfo(settings.saved_governor, driver).label
+      : null,
+    settings?.saved_clock != null
+      ? t("{{frequency}} clock lock", { frequency: formatFreq(settings.saved_clock) })
+      : null,
+    settings?.saved_boost != null && status?.boost != null
+      ? t("CPU boost: {{state}}", { state: t(settings.saved_boost ? "On" : "Off") })
+      : null,
   ].filter(Boolean);
   const restoreDescription = savedParts.length
-    ? `Re-applies ${savedParts.join(", ")} when Decky starts. The kernel picks its default governor and clock range at boot.`
-    : "Re-applies your last governor and clock lock when Decky starts. The kernel picks its default governor and clock range at boot.";
+    ? t("Re-applies {{settings}} when Decky starts. The kernel picks its default governor and clock range at boot.", { settings: savedParts.join(", ") })
+    : t("Re-applies your last governor and clock lock when Decky starts. The kernel picks its default governor and clock range at boot.");
 
   return (
     <>
-      <PanelSection title="CPU Frequency">
+      <PanelSection title={t("CPU Frequency")}>
         {consoleInfo?.pro && (
           <PanelSectionRow>
-            <div className="ps5hw-note">{PRO_CPU_NOTE}</div>
+            <div className="ps5hw-note">{t(PRO_CPU_NOTE)}</div>
           </PanelSectionRow>
         )}
         <PanelSectionRow>
           <Field
-            label="Governor"
+            label={t("Governor")}
             icon={<FaTachometerAlt />}
             description={
-              statusError ?? (active.length > 1 ? `CPUs use ${active.join(", ")}` : undefined)
+              statusError ??
+              (active.length > 1 ? `CPUs use ${active.join(", ")}` : undefined)
             }
           >
             {governorValue}
@@ -1575,8 +1848,14 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         {status !== null && (
           <>
             <PanelSectionRow>
-              <Field label="Frequency" icon={<FaMicrochip />} description={freqDescription || undefined}>
-                {status.freq_avg_mhz != null ? formatFreq(status.freq_avg_mhz) : "Unknown"}
+              <Field
+                label={t("Frequency")}
+                icon={<FaMicrochip />}
+                description={freqDescription || undefined}
+              >
+                {status.freq_avg_mhz != null
+                  ? formatFreq(status.freq_avg_mhz)
+                  : t("Unknown")}
               </Field>
             </PanelSectionRow>
             {status.boost !== null && (
@@ -1592,15 +1871,22 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
               </PanelSectionRow>
             )}
             <PanelSectionRow>
-              <Field label="Driver" description={`${status.policy_count} frequency policies`}>
-                {driver ?? "Unknown"}
+              <Field
+                label={t("Driver")}
+                description={t("{{count}} frequency policies", {
+                  count: status.policy_count,
+                })}
+              >
+                {driver ?? t("Unknown")}
               </Field>
             </PanelSectionRow>
           </>
         )}
       </PanelSection>
       {governors.length > 0 && (
-        <PanelSection title={`Governors (${governors.length})`}>
+        <PanelSection
+          title={t("Governors ({{count}})", { count: governors.length })}
+        >
           {chunk(governors, 2).map((row, rowIndex) => (
             <ButtonGrid key={row.join("|")} columns={2}>
               {row.map((id, index) => {
@@ -1608,10 +1894,16 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 return (
                   <DialogButton
                     key={id}
-                    className={gridButtonClass(rowIndex * 2 + index, governors.length, 2)}
+                    className={gridButtonClass(
+                      rowIndex * 2 + index,
+                      governors.length,
+                      2,
+                    )}
                     disabled={busy}
                     onClick={() => applyGovernor(id)}
-                    style={{ borderBottom: `2px solid ${current === id ? ACCENT : "transparent"}` }}
+                    style={{
+                      borderBottom: `2px solid ${current === id ? ACCENT : "transparent"}`,
+                    }}
                   >
                     {applying === id ? (
                       <InlineSpinner />
@@ -1629,7 +1921,7 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSection>
       )}
       <ClockLockSection
-        description="Pins every CPU to this clock, whatever the governor."
+        description={t("Pins every CPU to this clock, whatever the governor.")}
         hwMin={status?.hw_min_mhz ?? null}
         hwMax={status?.hw_max_mhz ?? null}
         steps={status?.available_mhz ?? []}
@@ -1639,10 +1931,10 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         applying={applying}
         onApply={applyClock}
       />
-      <PanelSection title="Advanced">
+      <PanelSection title={t("Advanced")}>
         <PanelSectionRow>
           <ToggleField
-            label="Restore on Startup"
+            label={t("Restore on Startup")}
             description={restoreDescription}
             checked={settings?.restore_on_boot ?? false}
             disabled={settings === null || savingSettings}
@@ -1700,9 +1992,9 @@ const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backe
     }
     showModal(
       <ConfirmModal
-        strTitle={`Unlock ${target} CUs`}
-        strDescription={`This adds ${CU_ARGUMENTS[target]} to cmdline.txt and takes effect after a reboot. Some of the disabled CUs can be faulty, which causes visual glitches. 38 CUs turns them all on and then masks one fixed pair, so it may not avoid a faulty one. If the screen is unusable after rebooting, remove the arguments from cmdline.txt over SSH or from another computer. The previous version is saved as cmdline.txt.bak.`}
-        strOKButtonText="Unlock"
+        strTitle={t("Unlock {{count}} CUs", { count: target })}
+        strDescription={t("This adds {{arguments}} to cmdline.txt and takes effect after a reboot. Some of the disabled CUs can be faulty, which causes visual glitches. 38 CUs turns them all on and then masks one fixed pair, so it may not avoid a faulty one. If the screen is unusable after rebooting, remove the arguments from cmdline.txt over SSH or from another computer. The previous version is saved as cmdline.txt.bak.", { arguments: CU_ARGUMENTS[target] })}
+        strOKButtonText={t("Unlock")}
         bDestructiveWarning
         onOK={() => save(target)}
       />,
@@ -1740,33 +2032,33 @@ const CuUnlockSection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backe
   const supported = running !== null;
   const ready = supported && state?.cmdline_path != null;
 
-  let mode = running === null ? "" : CU_UNLOCK_MODES[running] ?? `Mode ${running}`;
+  let mode = running === null ? "" : CU_UNLOCK_MODES[running] ?? t("Mode {{mode}}", { mode: running });
   if (state?.running_target === 38) {
     mode = "38 CUs";
   } else if (state?.running_mask) {
-    mode = `${mode}, masked ${state.running_mask}`;
+    mode = t("{{mode}}, masked {{mask}}", { mode, mask: state.running_mask });
   }
 
   let note = CU_UNLOCK_ABOUT;
   if (state !== null && !supported) {
-    note = "This kernel doesn't include the CU unlock (amdgpu.ps5_cu_unlock).";
+    note = t("This kernel doesn't include the CU unlock (amdgpu.ps5_cu_unlock).");
   } else if (state !== null && !ready) {
-    note = `${state.boot_error} You can also add amdgpu.ps5_cu_unlock=3 to cmdline.txt by hand.`;
+    note = t("{{error}} You can also add amdgpu.ps5_cu_unlock=3 to cmdline.txt by hand.", { error: state.boot_error ?? "" });
   } else if (state?.pending) {
-    note = `${CU_UNLOCK_ABOUT} Reboot to apply your change.`;
+    note = t("{{about}} Reboot to apply your change.", { about: CU_UNLOCK_ABOUT });
   }
   const canReload = ready && state?.pending === true;
   const blocker = state?.reload_blocker ?? null;
 
   return (
-    <PanelSection title="CU Unlock">
+    <PanelSection title={t("CU Unlock")}>
       <PanelSectionRow>
         <Field
-          label="Active CUs"
+          label={t("Active CUs")}
           icon={<FaMicrochip />}
-          description={supported ? `Unlock this boot: ${mode}` : undefined}
+          description={supported ? t("Unlock this boot: {{mode}}", { mode }) : undefined}
         >
-          {state === null ? <InlineSpinner /> : state.active_cus ?? "Unknown"}
+          {state === null ? <InlineSpinner /> : state.active_cus ?? t("Unknown")}
         </Field>
       </PanelSectionRow>
       <ButtonGrid columns={CU_CHOICES.length}>
@@ -2370,10 +2662,10 @@ const vramDescription = (memory: GpuMemoryData) => {
     return memory.boot_error ?? undefined;
   }
   if (configured < TOO_SMALL_VRAM) {
-    return `vram.txt asks for ${formatBytes(configured)}, which can cause a black screen. It's read as hex, so it was probably written in decimal. Pick a size below.`;
+    return t("vram.txt asks for {{size}}, which can cause a black screen. It's read as hex, so it was probably written in decimal. Pick a size below.", { size: formatBytes(configured) });
   }
   if (running !== null && Math.abs(running - configured) > configured / 16) {
-    return `${formatBytes(configured)} after a reboot`;
+    return t("{{size}} after a reboot", { size: formatBytes(configured) });
   }
   return undefined;
 };
@@ -2456,15 +2748,15 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
   const pages = memory?.gtt_pages ?? null;
 
   return (
-    <PanelSection title="GPU Memory">
+    <PanelSection title={t("GPU Memory")}>
       <PanelSectionRow>
-        <Field label="VRAM" icon={<FaCube />} description={memory ? vramDescription(memory) : undefined}>
+        <Field label={t("VRAM")} icon={<FaCube />} description={memory ? vramDescription(memory) : undefined}>
           {memory === null ? (
             <InlineSpinner />
           ) : memory.vram_running !== null ? (
             formatBytes(memory.vram_running)
           ) : (
-            "Unknown"
+            t("Unknown")
           )}
         </Field>
       </PanelSectionRow>
@@ -2526,14 +2818,14 @@ const GpuMemorySection: FC<{ backend: ReturnType<typeof useBackend> }> = ({ back
       </PanelSectionRow>
       <PanelSectionRow>
         <Field
-          label="GTT Limit"
+          label={t("GTT Limit")}
           icon={<FaMemory />}
-          description={memory?.boot_ready && memory.gtt_pending ? "Takes effect after a reboot" : undefined}
+          description={memory?.boot_ready && memory.gtt_pending ? t("Takes effect after a reboot") : undefined}
         >
           {memory === null ? (
             <InlineSpinner />
           ) : pages === null ? (
-            "Default"
+            t("Default")
           ) : (
             formatBytes(pages * 4096)
           )}
@@ -2938,7 +3230,9 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     }
     if (result.success) {
       setStatus(result.data);
-      setSettings((prev) => (prev ? { ...prev, saved_governor: governor } : prev));
+      setSettings((prev) =>
+        prev ? { ...prev, saved_governor: governor } : prev,
+      );
     }
     notify(result);
     setApplying(null);
@@ -2953,7 +3247,9 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     }
     if (result.success) {
       setStatus(result.data);
-      setSettings((prev) => (prev ? { ...prev, saved_clock: result.data.locked_mhz } : prev));
+      setSettings((prev) =>
+        prev ? { ...prev, saved_clock: result.data.locked_mhz } : prev,
+      );
     }
     notify(result);
     setApplying(null);
@@ -2978,7 +3274,7 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const current = status?.active ?? null;
   const busy = applying !== null;
 
-  let governorValue: ReactNode = "Unavailable";
+  let governorValue: ReactNode = t("Unavailable");
   if (loading) {
     governorValue = <InlineSpinner />;
   } else if (current) {
@@ -2987,7 +3283,9 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
 
   const locked = status?.locked_mhz ?? null;
   const freqDescription = [
-    status?.target_mhz != null ? `Target ${formatFreq(status.target_mhz)}` : null,
+    status?.target_mhz != null
+      ? `Target ${formatFreq(status.target_mhz)}`
+      : null,
     locked !== null
       ? `Locked at ${formatFreq(locked)}`
       : status?.min_mhz != null && status?.max_mhz != null
@@ -2998,41 +3296,58 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
     .join(" · ");
 
   const savedParts = [
-    settings?.saved_governor != null ? gpuGovernorInfo(settings.saved_governor).label : null,
-    settings?.saved_clock != null ? `the ${formatFreq(settings.saved_clock)} clock lock` : null,
+    settings?.saved_governor != null
+      ? gpuGovernorInfo(settings.saved_governor).label
+      : null,
+    settings?.saved_clock != null
+      ? t("{{frequency}} clock lock", {
+          frequency: formatFreq(settings.saved_clock),
+        })
+      : null,
   ].filter(Boolean);
   const restoreDescription = savedParts.length
-    ? `Re-applies ${savedParts.join(" and ")} when Decky starts. The kernel starts the GPU on Ondemand at boot.`
-    : "Re-applies your last GPU governor and clock lock when Decky starts. The kernel starts the GPU on Ondemand at boot.";
+    ? t(
+        "Re-applies {{settings}} when Decky starts. The kernel starts the GPU on Ondemand at boot.",
+        { settings: savedParts.join(t(" and ")) },
+      )
+    : t(
+        "Re-applies your last GPU governor and clock lock when Decky starts. The kernel starts the GPU on Ondemand at boot.",
+      );
 
   return (
     <>
-      <PanelSection title="GPU Frequency">
+      <PanelSection title={t("GPU Frequency")}>
         <PanelSectionRow>
-          <Field label="Governor" icon={<FaTachometerAlt />} description={statusError ?? undefined}>
+          <Field
+            label={t("Governor")}
+            icon={<FaTachometerAlt />}
+            description={statusError ?? undefined}
+          >
             {governorValue}
           </Field>
         </PanelSectionRow>
         {status !== null && (
           <>
             <PanelSectionRow>
-              <Field label="Clock" icon={<FaCube />} description={freqDescription || undefined}>
+              <Field label={t("Clock")} icon={<FaCube />} description={freqDescription || undefined}>
                 {status.freq_mhz != null && (status.freq_mhz > 0 || !pro)
                   ? formatFreq(status.freq_mhz)
                   : pro
-                    ? "Idle"
-                    : "Unknown"}
+                    ? t("Idle")
+                    : t("Unknown")}
               </Field>
             </PanelSectionRow>
             <PanelSectionRow>
-              <Field label="Device">{status.device}</Field>
+              <Field label={t("Device")}>{status.device}</Field>
             </PanelSectionRow>
           </>
         )}
         {pro && <ProGpuRows backend={backend} status={proStatus} />}
       </PanelSection>
       {governors.length > 0 && (
-        <PanelSection title={`Governors (${governors.length})`}>
+        <PanelSection
+          title={t("Governors ({{count}})", { count: governors.length })}
+        >
           {chunk(governors, 2).map((row, rowIndex) => (
             <ButtonGrid key={row.join("|")} columns={2}>
               {row.map((id, index) => {
@@ -3040,10 +3355,16 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 return (
                   <DialogButton
                     key={id}
-                    className={gridButtonClass(rowIndex * 2 + index, governors.length, 2)}
+                    className={gridButtonClass(
+                      rowIndex * 2 + index,
+                      governors.length,
+                      2,
+                    )}
                     disabled={busy}
                     onClick={() => applyGovernor(id)}
-                    style={{ borderBottom: `2px solid ${current === id ? ACCENT : "transparent"}` }}
+                    style={{
+                      borderBottom: `2px solid ${current === id ? ACCENT : "transparent"}`,
+                    }}
                   >
                     {applying === id ? (
                       <InlineSpinner />
@@ -3061,7 +3382,9 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSection>
       )}
       <ClockLockSection
-        description="Pins the GPU to this clock, whatever the governor. The firmware still overrides it while the CPU boosts."
+        description={t(
+          "Pins the GPU to this clock, whatever the governor. The firmware still overrides it while the CPU boosts.",
+        )}
         hwMin={status?.hw_min_mhz ?? null}
         hwMax={status?.hw_max_mhz ?? null}
         steps={status?.available_mhz ?? []}
@@ -3071,10 +3394,10 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         applying={applying}
         onApply={applyClock}
       />
-      <PanelSection title="Advanced">
+      <PanelSection title={t("Advanced")}>
         <PanelSectionRow>
           <ToggleField
-            label="Restore on Startup"
+            label={t("Restore on Startup")}
             description={restoreDescription}
             checked={settings?.restore_on_boot ?? false}
             disabled={settings === null || savingSettings}
@@ -3089,7 +3412,9 @@ const GpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   );
 };
 
-const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => {
+const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({
+  backend,
+}) => {
   const { call, notify } = backend;
   const [presets, setPresets] = useState<string[] | null>(null);
   const [animated, setAnimated] = useState<Set<string>>(new Set());
@@ -3181,53 +3506,73 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
   const changeLoopSeconds = (value: number) => {
     setLoopSeconds(value);
     window.clearTimeout(loopTimer.current);
-    loopTimer.current = window.setTimeout(() => saveLoop(null, value), THRESHOLD_SAVE_DELAY_MS);
+    loopTimer.current = window.setTimeout(
+      () => saveLoop(null, value),
+      THRESHOLD_SAVE_DELAY_MS,
+    );
   };
 
   const available = useMemo(() => new Set(presets ?? []), [presets]);
-  const isAvailable = (id: string) => presets === null || available.has(id) || id === "off";
+  const isAvailable = (id: string) =>
+    presets === null || available.has(id) || id === "off";
   const busy = loading || pending !== null;
   const loopEnabled = loop?.loop_enabled ?? false;
 
   const filtered = useMemo(() => {
     const query = filter.trim().toLowerCase();
     return (presets ?? []).filter(
-      (id) => !query || id.includes(query) || prettifyPreset(id).toLowerCase().includes(query),
+      (id) =>
+        !query ||
+        id.includes(query) ||
+        prettifyPreset(id).toLowerCase().includes(query),
     );
   }, [presets, filter]);
 
-  let loopStatus = "Off";
+  let loopStatus = t("Off");
   if (loopEnabled && loop?.looping && active) {
-    loopStatus = `Looping ${prettifyPreset(active)}`;
+    loopStatus = t("Looping {{preset}}", { preset: prettifyPreset(active) });
   } else if (loopEnabled) {
-    loopStatus = "Waiting for an animated preset";
+    loopStatus = t("Waiting for an animated preset");
   }
 
   const savedPreset = loop?.saved_preset ?? null;
   const restoreDescription = savedPreset
-    ? `Re-applies ${prettifyPreset(savedPreset)} when Decky starts. The kernel picks its default LED at boot.`
-    : "Re-applies your last LED preset when Decky starts. The kernel picks its default LED at boot.";
+    ? t(
+        "Re-applies {{preset}} when Decky starts. The kernel picks its default LED at boot.",
+        { preset: prettifyPreset(savedPreset) },
+      )
+    : t(
+        "Re-applies your last LED preset when Decky starts. The kernel picks its default LED at boot.",
+      );
 
   const presetDescription = (id: string) => {
     const tags: string[] = [];
     if (active === id) {
-      tags.push(loopEnabled && animated.has(id) ? "Active · looping" : "Active");
+      tags.push(
+        loopEnabled && animated.has(id) ? t("Active · looping") : t("Active"),
+      );
     } else if (animated.has(id)) {
-      tags.push("Animated");
+      tags.push(t("Animated"));
     }
     return tags.length ? tags.join(" · ") : undefined;
   };
 
   return (
     <>
-      <PanelSection title="LED Presets">
+      <PanelSection title={t("LED Presets")}>
         <PanelSectionRow>
           <Field
-            label="Active Preset"
+            label={t("Active Preset")}
             icon={<FaLightbulb />}
             description={error ?? undefined}
           >
-            {loading ? <InlineSpinner /> : active ? prettifyPreset(active) : "Unknown"}
+            {loading ? (
+              <InlineSpinner />
+            ) : active ? (
+              prettifyPreset(active)
+            ) : (
+              t("Unknown")
+            )}
           </Field>
         </PanelSectionRow>
         {chunk(CURATED_PRESETS, 2).map((row, rowIndex) => (
@@ -3237,10 +3582,16 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
               return (
                 <DialogButton
                   key={preset.id}
-                  className={gridButtonClass(rowIndex * 2 + index, CURATED_PRESETS.length, 2)}
+                  className={gridButtonClass(
+                    rowIndex * 2 + index,
+                    CURATED_PRESETS.length,
+                    2,
+                  )}
                   disabled={busy || !isAvailable(preset.id)}
                   onClick={() => apply(preset.id)}
-                  style={{ borderBottom: `2px solid ${selected ? ACCENT : "transparent"}` }}
+                  style={{
+                    borderBottom: `2px solid ${selected ? ACCENT : "transparent"}`,
+                  }}
                 >
                   {pending === preset.id ? <InlineSpinner /> : preset.label}
                 </DialogButton>
@@ -3249,16 +3600,26 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           </ButtonGrid>
         ))}
         <PanelSectionRow>
-          <ButtonItem layout="below" disabled={busy} onClick={() => refresh(false)}>
-            <ButtonLabel icon={<FaSyncAlt />} label="Refresh Presets" busy={loading} />
+          <ButtonItem
+            layout="below"
+            disabled={busy}
+            onClick={() => refresh(false)}
+          >
+            <ButtonLabel
+              icon={<FaSyncAlt />}
+              label={t("Refresh Presets")}
+              busy={loading}
+            />
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
-      <PanelSection title="Animations">
+      <PanelSection title={t("Animations")}>
         <PanelSectionRow>
           <ToggleField
-            label="Loop Animations"
-            description="Replays breathe, pulse and other animated presets so they keep going."
+            label={t("Loop Animations")}
+            description={t(
+              "Replays breathe, pulse and other animated presets so they keep going.",
+            )}
             checked={loopEnabled}
             disabled={loop === null || savingLoop}
             onChange={(checked) => saveLoop(checked, null)}
@@ -3266,8 +3627,8 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSectionRow>
         <PanelSectionRow>
           <SliderField
-            label="Replay Every"
-            description="Match this to how long the animation runs."
+            label={t("Replay Every")}
+            description={t("Match this to how long the animation runs.")}
             value={loopSeconds}
             min={LED_LOOP_MIN}
             max={LED_LOOP_MAX}
@@ -3280,15 +3641,15 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
           />
         </PanelSectionRow>
         <PanelSectionRow>
-          <Field label="Loop Status" icon={<FaRedo />}>
+          <Field label={t("Loop Status")} icon={<FaRedo />}>
             {loopStatus}
           </Field>
         </PanelSectionRow>
       </PanelSection>
-      <PanelSection title="Advanced">
+      <PanelSection title={t("Advanced")}>
         <PanelSectionRow>
           <ToggleField
-            label="Restore on Startup"
+            label={t("Restore on Startup")}
             description={restoreDescription}
             checked={loop?.restore_on_boot ?? false}
             disabled={loop === null || savingLoop}
@@ -3297,10 +3658,12 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
         </PanelSectionRow>
       </PanelSection>
       {presets !== null && presets.length > 0 && (
-        <PanelSection title={`All Presets (${presets.length})`}>
+        <PanelSection
+          title={t("All Presets ({{count}})", { count: presets.length })}
+        >
           <PanelSectionRow>
             <TextField
-              label="Filter"
+              label={t("Filter")}
               value={filter}
               bShowClearAction
               onChange={(e) => setFilter(e.target.value)}
@@ -3315,13 +3678,13 @@ const LedTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
                 disabled={busy}
                 onClick={() => apply(id)}
               >
-                {pending === id ? <InlineSpinner /> : "Apply"}
+                {pending === id ? <InlineSpinner /> : t("Apply")}
               </ButtonItem>
             </PanelSectionRow>
           ))}
           {filtered.length === 0 && (
             <PanelSectionRow>
-              <Field label="No presets match" focusable={false} />
+              <Field label={t("No presets match")} focusable={false} />
             </PanelSectionRow>
           )}
         </PanelSection>
