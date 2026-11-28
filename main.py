@@ -292,6 +292,10 @@ def _fail(error):
     return {"success": False, "error": error}
 
 
+def _unsupported(reason):
+    return {"success": False, "error": reason, "unsupported": True}
+
+
 def _led_brightness_path(preset):
     return f"{LED_CLASS_DIR}/{LED_PREFIX}{preset}{LED_SUFFIX}/brightness"
 
@@ -1189,12 +1193,28 @@ def _write_governor_sync(governor):
         raise failures[0]
 
 
-async def _read_cpufreq():
+def _cpufreq_missing():
     if not os.path.isdir(CPUFREQ_DIR):
-        return False, (
+        return (
             f"{CPUFREQ_DIR} does not exist. No cpufreq driver is loaded "
             "(check that amd_pstate or acpi-cpufreq is enabled in the kernel)"
         )
+    try:
+        entries = os.listdir(CPUFREQ_DIR)
+    except OSError:
+        return None
+    if not any(CPU_POLICY_PATTERN.fullmatch(entry) for entry in entries):
+        return (
+            "No cpufreq driver is running, so CPU clocks can't be read or changed. "
+            "This kernel has no ps5-cpufreq driver (rmuxnet's kernel has one)"
+        )
+    return None
+
+
+async def _read_cpufreq():
+    missing = _cpufreq_missing()
+    if missing:
+        return False, missing
     ok, result = await _guarded_io("Reading CPU frequency", CPUFREQ_DIR, _scan_cpufreq)
     if ok and not result["governors"]:
         return False, f"The {result['driver'] or 'cpufreq'} driver exposes no governors"
@@ -2803,6 +2823,9 @@ class Plugin:
         return _ok(f"LED preset '{preset}' applied", {"preset": preset, **_led_settings_snapshot()})
 
     async def get_cpu_status(self):
+        missing = _cpufreq_missing()
+        if missing:
+            return _unsupported(missing)
         async with _cpu_lock:
             ok, result = await _read_cpufreq()
         if not ok:

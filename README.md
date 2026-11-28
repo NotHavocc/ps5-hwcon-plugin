@@ -11,6 +11,12 @@
 </p>
 
 <p align="center">
+  <img alt="GitHub Release" src="https://img.shields.io/github/v/release/NotHavocc/ps5-hwcon-plugin">
+  <img alt="Discord" src="https://img.shields.io/discord/1562764939486298175?logo=discord&label=PS5Linux%20Server">
+  <img alt="Static" src=" https://img.shields.io/badge/open_source-with_%3C3-blue">
+</p>
+
+<p align="center">
   A <a href="https://decky.xyz">Decky Loader</a> plugin for PS5 Linux: fan curve or target temperature, live temperatures, CPU and GPU governors and clocks, CPU boost, GPU thermal limit, GPU memory, zram, zswap and a swap file, display boot options, warm reboot and indicator LED presets, all from the Quick Access Menu.
 </p>
 

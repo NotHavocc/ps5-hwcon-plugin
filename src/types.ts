@@ -7,6 +7,7 @@ export interface BackendSuccess<T> {
 export interface BackendFailure {
   success: false;
   error: string;
+  unsupported?: boolean;
 }
 
 export type BackendResult<T = null> = BackendSuccess<T> | BackendFailure;

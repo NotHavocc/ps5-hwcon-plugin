@@ -1442,7 +1442,7 @@ const CpuTab: FC<{ backend: ReturnType<typeof useBackend> }> = ({ backend }) => 
       if (!alive.current) {
         return;
       }
-      if (statusResult) {
+      if (statusResult && (statusResult.success || !statusResult.unsupported)) {
         notify(statusResult, true);
       }
       if (settingsResult.success) {

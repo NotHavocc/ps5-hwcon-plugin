@@ -1,6 +1,6 @@
 {
   "name": "ps5-hardware-control",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Decky Loader plugin for PS5 fan, CPU/GPU governor and LED control on Linux",
   "type": "module",
   "scripts": {
