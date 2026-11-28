@@ -2203,6 +2203,23 @@ def _bazzite_warm_reboot_sync():
     return None
 
 
+# Bluetooth (btusb) keeps its state across kexec and can hang the next kernel's Bluetooth
+# stack (hci0 worker stuck, rfkill and settings hanging). Release it and the IW620 Wi-Fi
+# driver (moal/mlan) first, after the new kernel is loaded so a failed load leaves them
+# running. Wi-Fi on the IW620 may still need a cold boot to come back.
+KEXEC_RELEASE_MODULES = ("btusb", "moal", "mlan")
+
+
+def _release_radios_for_kexec_sync():
+    if shutil.which("systemctl"):
+        _run_command("systemctl", "stop", "bluetooth.service", timeout=15)
+    for module in KEXEC_RELEASE_MODULES:
+        if os.path.isdir(f"{MODULE_DIR}/{module}"):
+            result = _run_command("modprobe", "-r", module, timeout=15)
+            if result is None or result.returncode != 0:
+                logger.warning(f"Couldn't unload {module} before the warm reboot")
+
+
 def _warm_reboot_sync():
     if shutil.which(BAZZITE_KEXEC):
         return _bazzite_warm_reboot_sync()
@@ -2213,6 +2230,7 @@ def _warm_reboot_sync():
     result = _run_command("kexec", "-l", kernel, f"--initrd={initrd}", f"--append={line}")
     if result is None or result.returncode != 0:
         return _command_error(result, "kexec")
+    _release_radios_for_kexec_sync()
     if shutil.which("systemctl"):
         result = _run_command("systemctl", "kexec", "-i")
         name = "systemctl kexec"
